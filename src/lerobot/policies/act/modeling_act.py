@@ -33,9 +33,78 @@ from torch import Tensor, nn
 from torchvision.models._utils import IntermediateLayerGetter
 from torchvision.ops.misc import FrozenBatchNorm2d
 
+try:
+    from transformers import Dinov2Model, SiglipVisionModel
+except ImportError:
+    Dinov2Model = None
+    SiglipVisionModel = None
+
 from lerobot.policies.act.configuration_act import ACTConfig
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
+
+
+class SiglipBackboneWrapper(nn.Module):
+    """Wraps a SigLIP vision model to produce 2D feature maps compatible with the ACT encoder.
+
+    SigLIP outputs (B, num_patches, hidden_size) patch tokens. This wrapper reshapes them
+    to (B, hidden_size, H, W) and returns {"feature_map": ...} to match the ResNet backbone interface.
+    """
+
+    def __init__(self, model_name: str):
+        super().__init__()
+        if SiglipVisionModel is None:
+            raise ImportError(
+                "SigLIP backbone requires the `transformers` library. "
+                "Install it with: pip install transformers"
+            )
+        self.vision_model = SiglipVisionModel.from_pretrained(model_name)
+        self.hidden_size = self.vision_model.config.hidden_size
+        self.patch_size = self.vision_model.config.patch_size
+        self.image_size = self.vision_model.config.image_size
+        self.grid_size = self.image_size // self.patch_size
+
+    def forward(self, x: Tensor) -> dict[str, Tensor]:
+        if x.shape[-2:] != (self.image_size, self.image_size):
+            x = F.interpolate(x, size=(self.image_size, self.image_size), mode="bilinear", align_corners=False)
+        out = self.vision_model(pixel_values=x)
+        patches = out.last_hidden_state  # (B, num_patches, hidden_size)
+        feature_map = einops.rearrange(
+            patches, "b (h w) c -> b c h w", h=self.grid_size, w=self.grid_size
+        )
+        return {"feature_map": feature_map}
+
+
+class Dinov2BackboneWrapper(nn.Module):
+    """Wraps a DINOv2 vision model to produce 2D feature maps compatible with the ACT encoder.
+
+    DINOv2 outputs (B, 1 + num_patches, hidden_size) — a CLS token followed by patch tokens.
+    This wrapper strips the CLS token, reshapes patch tokens to (B, hidden_size, H, W),
+    and returns {"feature_map": ...} to match the ResNet backbone interface.
+    """
+
+    def __init__(self, model_name: str):
+        super().__init__()
+        if Dinov2Model is None:
+            raise ImportError(
+                "DINOv2 backbone requires the `transformers` library. "
+                "Install it with: pip install transformers"
+            )
+        self.vision_model = Dinov2Model.from_pretrained(model_name)
+        self.hidden_size = self.vision_model.config.hidden_size
+        self.patch_size = self.vision_model.config.patch_size
+        self.image_size = self.vision_model.config.image_size
+        self.grid_size = self.image_size // self.patch_size
+
+    def forward(self, x: Tensor) -> dict[str, Tensor]:
+        if x.shape[-2:] != (self.image_size, self.image_size):
+            x = F.interpolate(x, size=(self.image_size, self.image_size), mode="bilinear", align_corners=False)
+        out = self.vision_model(pixel_values=x)
+        patches = out.last_hidden_state[:, 1:]  # strip CLS token → (B, num_patches, hidden_size)
+        feature_map = einops.rearrange(
+            patches, "b (h w) c -> b c h w", h=self.grid_size, w=self.grid_size
+        )
+        return {"feature_map": feature_map}
 
 
 class ACTPolicy(PreTrainedPolicy):
@@ -321,15 +390,27 @@ class ACT(nn.Module):
 
         # Backbone for image feature extraction.
         if self.config.image_features:
-            backbone_model = getattr(torchvision.models, config.vision_backbone)(
-                replace_stride_with_dilation=[False, False, config.replace_final_stride_with_dilation],
-                weights=config.pretrained_backbone_weights,
-                norm_layer=FrozenBatchNorm2d,
-            )
-            # Note: The assumption here is that we are using a ResNet model (and hence layer4 is the final
-            # feature map).
-            # Note: The forward method of this returns a dict: {"feature_map": output}.
-            self.backbone = IntermediateLayerGetter(backbone_model, return_layers={"layer4": "feature_map"})
+            if config.vision_backbone.startswith("siglip"):
+                siglip_wrapper = SiglipBackboneWrapper(config.siglip_model_name)
+                self.backbone = siglip_wrapper
+                backbone_out_channels = siglip_wrapper.hidden_size
+            elif config.vision_backbone.startswith("dinov2"):
+                dinov2_wrapper = Dinov2BackboneWrapper(config.dinov2_model_name)
+                self.backbone = dinov2_wrapper
+                backbone_out_channels = dinov2_wrapper.hidden_size
+            else:
+                backbone_model = getattr(torchvision.models, config.vision_backbone)(
+                    replace_stride_with_dilation=[False, False, config.replace_final_stride_with_dilation],
+                    weights=config.pretrained_backbone_weights,
+                    norm_layer=FrozenBatchNorm2d,
+                )
+                self.backbone = IntermediateLayerGetter(
+                    backbone_model, return_layers={"layer4": "feature_map"}
+                )
+                backbone_out_channels = backbone_model.fc.in_features
+
+            if config.freeze_backbone:
+                self.backbone.requires_grad_(False)
 
         # Transformer (acts as VAE decoder when training with the variational objective).
         self.encoder = ACTEncoder(config)
@@ -348,7 +429,7 @@ class ACT(nn.Module):
         self.encoder_latent_input_proj = nn.Linear(config.latent_dim, config.dim_model)
         if self.config.image_features:
             self.encoder_img_feat_input_proj = nn.Conv2d(
-                backbone_model.fc.in_features, config.dim_model, kernel_size=1
+                backbone_out_channels, config.dim_model, kernel_size=1
             )
         # Transformer encoder positional embeddings.
         n_1d_tokens = 1  # for the latent

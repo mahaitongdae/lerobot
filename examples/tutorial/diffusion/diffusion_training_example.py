@@ -24,7 +24,7 @@ def main():
     output_directory.mkdir(parents=True, exist_ok=True)
 
     # Select your device
-    device = torch.device("mps")  # or "cuda" or "cpu"
+    device = torch.device("cuda:0")  # or "cuda" or "cpu"
 
     dataset_id = "lerobot/svla_so101_pickplace"
 

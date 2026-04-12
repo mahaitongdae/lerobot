@@ -54,11 +54,18 @@ class ACTConfig(PreTrainedConfig):
             the output data name, and the value is PolicyFeature, which consists of FeatureType and shape attributes.
         normalization_mapping: A dictionary that maps from a str value of FeatureType (e.g., "STATE", "VISUAL") to
             a corresponding NormalizationMode (e.g., NormalizationMode.MIN_MAX)
-        vision_backbone: Name of the torchvision resnet backbone to use for encoding images.
+        vision_backbone: Name of the vision backbone to use for encoding images. Supports torchvision
+            ResNet variants (e.g. "resnet18"), "siglip" (requires `siglip_model_name`), or "dinov2"
+            (requires `dinov2_model_name`).
         pretrained_backbone_weights: Pretrained weights from torchvision to initialize the backbone.
-            `None` means no pretrained weights.
+            `None` means no pretrained weights. Only used for ResNet backbones.
         replace_final_stride_with_dilation: Whether to replace the ResNet's final 2x2 stride with a dilated
-            convolution.
+            convolution. Only used for ResNet backbones.
+        siglip_model_name: HuggingFace model name for SigLIP (e.g. "google/siglip-base-patch16-224").
+            Required when `vision_backbone` starts with "siglip".
+        dinov2_model_name: HuggingFace model name for DINOv2 (e.g. "facebook/dinov2-small").
+            Required when `vision_backbone` starts with "dinov2".
+        freeze_backbone: If True, freeze vision backbone weights during training (no gradient updates).
         pre_norm: Whether to use "pre-norm" in the transformer blocks.
         dim_model: The transformer blocks' main hidden dimension.
         n_heads: The number of heads to use in the transformer blocks' multi-head attention.
@@ -99,6 +106,11 @@ class ACTConfig(PreTrainedConfig):
     vision_backbone: str = "resnet18"
     pretrained_backbone_weights: str | None = "ResNet18_Weights.IMAGENET1K_V1"
     replace_final_stride_with_dilation: int = False
+    # SigLIP backbone (used when vision_backbone starts with "siglip").
+    siglip_model_name: str | None = None
+    # DINOv2 backbone (used when vision_backbone starts with "dinov2").
+    dinov2_model_name: str | None = None
+    freeze_backbone: bool = False
     # Transformer layers.
     pre_norm: bool = False
     dim_model: int = 512
@@ -132,9 +144,20 @@ class ACTConfig(PreTrainedConfig):
         super().__post_init__()
 
         """Input validation (not exhaustive)."""
-        if not self.vision_backbone.startswith("resnet"):
+        supported_prefixes = ("resnet", "siglip", "dinov2")
+        if not any(self.vision_backbone.startswith(p) for p in supported_prefixes):
             raise ValueError(
-                f"`vision_backbone` must be one of the ResNet variants. Got {self.vision_backbone}."
+                f"`vision_backbone` must start with one of {supported_prefixes}. Got {self.vision_backbone}."
+            )
+        if self.vision_backbone.startswith("siglip") and not self.siglip_model_name:
+            raise ValueError(
+                "`siglip_model_name` must be set when using a SigLIP vision backbone "
+                "(e.g. 'google/siglip-base-patch16-224')."
+            )
+        if self.vision_backbone.startswith("dinov2") and not self.dinov2_model_name:
+            raise ValueError(
+                "`dinov2_model_name` must be set when using a DINOv2 vision backbone "
+                "(e.g. 'facebook/dinov2-small')."
             )
         if self.temporal_ensemble_coeff is not None and self.n_action_steps > 1:
             raise NotImplementedError(

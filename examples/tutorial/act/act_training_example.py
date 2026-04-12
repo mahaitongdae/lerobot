@@ -3,6 +3,9 @@
 from pathlib import Path
 
 import torch
+import tree
+import logging
+logging.basicConfig(level=logging.INFO)
 
 from lerobot.configs.types import FeatureType
 from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
@@ -20,13 +23,14 @@ def make_delta_timestamps(delta_indices: list[int] | None, fps: int) -> list[flo
 
 
 def main():
-    output_directory = Path("outputs/robot_learning_tutorial/act")
+    output_directory = Path("./outputs/robot_learning_tutorial/act")
     output_directory.mkdir(parents=True, exist_ok=True)
 
     # Select your device
-    device = torch.device("mps")  # or "cuda" or "cpu"
+    device = torch.device("cuda:0")  # or "cuda" or "cpu"
 
-    dataset_id = "lerobot/svla_so101_pickplace"
+    # dataset_id = "lerobot/svla_so101_pickplace"
+    dataset_id = "HuggingFaceVLA/libero"
 
     # This specifies the inputs the model will be expecting and the outputs it will produce
     dataset_metadata = LeRobotDatasetMetadata(dataset_id)
@@ -68,15 +72,24 @@ def main():
     )
 
     # Number of training steps and logging frequency
-    training_steps = 1
+    training_steps = 100
     log_freq = 1
 
     # Run training loop
     step = 0
     done = False
+    def get_shapes(batch):
+        return tree.map_structure(lambda x: x.shape if hasattr(x, 'shape') else x, batch)
+    def squeeze_data(batch):
+        return tree.map_structure(lambda x: x.squeeze() if isinstance(x, torch.Tensor) else x, batch)
     while not done:
         for batch in dataloader:
+            batch = squeeze_data(batch)
+            logging.debug("Before preprocessing:")
+            logging.debug(get_shapes(batch))
             batch = preprocessor(batch)
+            logging.debug("After preprocessing:")
+            logging.debug(get_shapes(batch))
             loss, _ = policy.forward(batch)
             loss.backward()
             optimizer.step()
@@ -94,10 +107,10 @@ def main():
     preprocessor.save_pretrained(output_directory)
     postprocessor.save_pretrained(output_directory)
 
-    # Save all assets to the Hub
-    policy.push_to_hub("<user>/robot_learning_tutorial_act")
-    preprocessor.push_to_hub("<user>/robot_learning_tutorial_act")
-    postprocessor.push_to_hub("<user>/robot_learning_tutorial_act")
+    # Save all assets to the Hub (uncomment and set your HF username to upload)
+    # policy.push_to_hub("YOUR_HF_USERNAME/robot_learning_tutorial_act")
+    # preprocessor.push_to_hub("YOUR_HF_USERNAME/robot_learning_tutorial_act")
+    # postprocessor.push_to_hub("YOUR_HF_USERNAME/robot_learning_tutorial_act")
 
 
 if __name__ == "__main__":
