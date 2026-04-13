@@ -106,6 +106,10 @@ class ACTConfig(PreTrainedConfig):
     vision_backbone: str = "resnet18"
     pretrained_backbone_weights: str | None = "ResNet18_Weights.IMAGENET1K_V1"
     replace_final_stride_with_dilation: int = False
+    # SSL-pretrained checkpoint (local path or URL) for ResNet backbones.
+    # Supports MoCo v1/v2/v3, SimCLR, BYOL, VISSL, and solo-learn formats.
+    # Key prefixes are auto-detected and stripped. Mutually exclusive with pretrained_backbone_weights.
+    ssl_checkpoint_path: str | None = None
     # SigLIP backbone (used when vision_backbone starts with "siglip").
     siglip_model_name: str | None = None
     # DINOv2 backbone (used when vision_backbone starts with "dinov2").
@@ -149,6 +153,14 @@ class ACTConfig(PreTrainedConfig):
             raise ValueError(
                 f"`vision_backbone` must start with one of {supported_prefixes}. Got {self.vision_backbone}."
             )
+        if self.ssl_checkpoint_path is not None:
+            if not self.vision_backbone.startswith("resnet"):
+                raise ValueError(
+                    "`ssl_checkpoint_path` is only supported for ResNet backbones. "
+                    f"Got vision_backbone={self.vision_backbone!r}."
+                )
+            if self.pretrained_backbone_weights is not None:
+                self.pretrained_backbone_weights = None
         if self.vision_backbone.startswith("siglip") and not self.siglip_model_name:
             raise ValueError(
                 "`siglip_model_name` must be set when using a SigLIP vision backbone "

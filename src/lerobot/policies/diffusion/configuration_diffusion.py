@@ -117,6 +117,10 @@ class DiffusionConfig(PreTrainedConfig):
     crop_shape: tuple[int, int] | None = (84, 84)
     crop_is_random: bool = True
     pretrained_backbone_weights: str | None = None
+    # SSL-pretrained checkpoint (local path or URL) for ResNet backbones.
+    # Supports MoCo v1/v2/v3, SimCLR, BYOL, VISSL, and solo-learn formats.
+    # Requires use_group_norm=False to preserve BatchNorm weights from SSL pretraining.
+    ssl_checkpoint_path: str | None = None
     use_group_norm: bool = True
     spatial_softmax_num_keypoints: int = 32
     use_separate_rgb_encoder_per_camera: bool = False
@@ -158,6 +162,12 @@ class DiffusionConfig(PreTrainedConfig):
             raise ValueError(
                 f"`vision_backbone` must be one of the ResNet variants. Got {self.vision_backbone}."
             )
+
+        if self.ssl_checkpoint_path is not None:
+            if self.pretrained_backbone_weights is not None:
+                self.pretrained_backbone_weights = None
+            if self.use_group_norm:
+                self.use_group_norm = False
 
         supported_prediction_types = ["epsilon", "sample"]
         if self.prediction_type not in supported_prediction_types:

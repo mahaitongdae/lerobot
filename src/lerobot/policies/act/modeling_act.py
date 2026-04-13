@@ -42,6 +42,7 @@ except ImportError:
 from lerobot.policies.act.configuration_act import ACTConfig
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
+from lerobot.utils.ssl_backbone import load_ssl_weights_into_resnet
 
 
 class SiglipBackboneWrapper(nn.Module):
@@ -404,6 +405,8 @@ class ACT(nn.Module):
                     weights=config.pretrained_backbone_weights,
                     norm_layer=FrozenBatchNorm2d,
                 )
+                if config.ssl_checkpoint_path is not None:
+                    load_ssl_weights_into_resnet(backbone_model, config.ssl_checkpoint_path)
                 self.backbone = IntermediateLayerGetter(
                     backbone_model, return_layers={"layer4": "feature_map"}
                 )

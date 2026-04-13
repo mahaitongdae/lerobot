@@ -344,13 +344,32 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     # create dataloader for offline training
     if hasattr(cfg.policy, "drop_n_last_frames"):
         shuffle = False
-        sampler = EpisodeAwareSampler(
-            dataset.meta.episodes["dataset_from_index"],
-            dataset.meta.episodes["dataset_to_index"],
-            episode_indices_to_use=dataset.episodes,
-            drop_n_last_frames=cfg.policy.drop_n_last_frames,
-            shuffle=True,
-        )
+        if dataset.episodes is not None:
+            ep_col = dataset.hf_dataset["episode_index"]
+            rel_from, rel_to = [], []
+            prev_ep = None
+            for i, ep in enumerate(ep_col):
+                ep_val = ep.item() if hasattr(ep, "item") else ep
+                if ep_val != prev_ep:
+                    if prev_ep is not None:
+                        rel_to.append(i)
+                    rel_from.append(i)
+                    prev_ep = ep_val
+            rel_to.append(len(ep_col))
+            sampler = EpisodeAwareSampler(
+                rel_from, rel_to,
+                episode_indices_to_use=None,
+                drop_n_last_frames=cfg.policy.drop_n_last_frames,
+                shuffle=True,
+            )
+        else:
+            sampler = EpisodeAwareSampler(
+                dataset.meta.episodes["dataset_from_index"],
+                dataset.meta.episodes["dataset_to_index"],
+                episode_indices_to_use=None,
+                drop_n_last_frames=cfg.policy.drop_n_last_frames,
+                shuffle=True,
+            )
     else:
         shuffle = True
         sampler = None

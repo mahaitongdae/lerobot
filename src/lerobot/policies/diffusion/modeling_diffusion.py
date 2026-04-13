@@ -35,6 +35,7 @@ from torch import Tensor, nn
 
 from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
 from lerobot.policies.pretrained import PreTrainedPolicy
+from lerobot.utils.ssl_backbone import load_ssl_weights_into_resnet
 from lerobot.policies.utils import (
     get_device_from_parameters,
     get_dtype_from_parameters,
@@ -461,6 +462,8 @@ class DiffusionRgbEncoder(nn.Module):
         backbone_model = getattr(torchvision.models, config.vision_backbone)(
             weights=config.pretrained_backbone_weights
         )
+        if config.ssl_checkpoint_path is not None:
+            load_ssl_weights_into_resnet(backbone_model, config.ssl_checkpoint_path)
         # Note: This assumes that the layer4 feature map is children()[-3]
         # TODO(alexander-soare): Use a safer alternative.
         self.backbone = nn.Sequential(*(list(backbone_model.children())[:-2]))

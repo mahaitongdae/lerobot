@@ -31,6 +31,10 @@ pytest_plugins = [
 ]
 
 
+def pytest_configure(config):
+    config.addinivalue_line("markers", "slow: marks tests that download large files or take a long time")
+
+
 def pytest_collection_finish():
     print(f"\nTesting with {DEVICE=}")
 
