@@ -1,20 +1,20 @@
 #!/usr/bin/env bash
-# Multi-task training: ACT and DP on all 4 LIBERO suites (10 tasks each)
+# Multi-task HP sweep: ACT and DP on all 4 LIBERO suites (10 tasks each)
 #
-# Grid: 2 policies × 4 suites = 8 jobs
+# Grid: 2 policies × 4 suites × 3 batch_sizes × 3 lrs = 72 jobs
 # Suites: libero_10, libero_spatial, libero_object, libero_goal
-# Total: 8 runs (1 per GPU with 8 GPUs)
+# Total: 72 runs
 #
 # Prerequisites:
 #   python scripts/cpmae/build_task_mapping.py   # generates task_mapping.json (one-time)
 #
 # Usage:
 #   bash scripts/cpmae/run_multitask_allsuites.sh 0 1 2 3 4 5 6 7   # 8 GPUs (all parallel)
-#   bash scripts/cpmae/run_multitask_allsuites.sh 0 1 2 3            # 4 GPUs (2 rounds)
+#   bash scripts/cpmae/run_multitask_allsuites.sh 0 1 2 3            # 4 GPUs
 #   bash scripts/cpmae/run_multitask_allsuites.sh 0                  # single GPU (sequential)
 #   DRY_RUN=1 bash scripts/cpmae/run_multitask_allsuites.sh 0 1      # print commands only
 #
-# Estimated: ~1.5 GPU-hours total (8 × ~11 min each at 1000 steps)
+# Estimated: ~100 GPU-hours total (72 × ~1.4h each at 100k steps)
 
 set -euo pipefail
 
@@ -29,8 +29,8 @@ EVAL_FREQ=0
 SAVE_FREQ=25000
 N_EVAL_EPISODES=20
 EVAL_BATCH=10
-BATCH_SIZE=32
-LR=1e-4
+BATCH_SIZES=(32 64 128)
+LRS=(1e-4 5e-5 1e-5)
 SEED=42
 RESULTS_DIR="results/multitask_allsuites"
 REPO_ID="HuggingFaceVLA/libero"
@@ -68,7 +68,7 @@ echo ""
 
 # ── run_task function ──────────────────────────────────────────────
 run_task() {
-    local policy="$1" suite="$2" job_seq="$3"
+    local policy="$1" suite="$2" bs="$3" lr="$4" job_seq="$5"
 
     # GPU assignment via job sequence number (unique, never recycled)
     local num_gpus=${#GPUS[@]}
@@ -87,7 +87,7 @@ run_task() {
     local task_index_offset="${!offset_var}"
 
     # Build run name
-    local run_name="MT_${policy}_${suite}_bs${BATCH_SIZE}_lr${LR}"
+    local run_name="MT_${policy}_${suite}_bs${bs}_lr${lr}"
     local run_dir="${RESULTS_DIR}/${run_name}"
 
     # Checkpoint skip
@@ -113,15 +113,15 @@ run_task() {
             --env.type=libero
             --env.task="$suite"
             --env.task_ids="$env_task_ids"
-            --batch_size="$BATCH_SIZE"
+            --batch_size="$bs"
             --steps="$STEPS"
             --eval_freq="$EVAL_FREQ"
             --save_freq="$SAVE_FREQ"
             --eval.n_episodes="$N_EVAL_EPISODES"
             --eval.batch_size="$EVAL_BATCH"
             --seed="$SEED"
-            --policy.optimizer_lr="$LR"
-            --policy.optimizer_lr_backbone="$LR"
+            --policy.optimizer_lr="$lr"
+            --policy.optimizer_lr_backbone="$lr"
             --output_dir="$run_dir"
             --job_name="$run_name"
             --wandb.enable=true
@@ -141,14 +141,14 @@ run_task() {
             --env.type=libero
             --env.task="$suite"
             --env.task_ids="$env_task_ids"
-            --batch_size="$BATCH_SIZE"
+            --batch_size="$bs"
             --steps="$STEPS"
             --eval_freq="$EVAL_FREQ"
             --save_freq="$SAVE_FREQ"
             --eval.n_episodes="$N_EVAL_EPISODES"
             --eval.batch_size="$EVAL_BATCH"
             --seed="$SEED"
-            --policy.optimizer_lr="$LR"
+            --policy.optimizer_lr="$lr"
             --output_dir="$run_dir"
             --job_name="$run_name"
             --wandb.enable=true
@@ -169,11 +169,11 @@ run_task() {
 }
 export -f run_task
 export GPUS REPO_ID RESULTS_DIR STEPS EVAL_FREQ SAVE_FREQ
-export N_EVAL_EPISODES EVAL_BATCH BATCH_SIZE LR SEED
+export N_EVAL_EPISODES EVAL_BATCH SEED
 
 # ── Launch ─────────────────────────────────────────────────────────
-TOTAL_JOBS=$(( ${#POLICIES[@]} * ${#SUITES[@]} ))
-echo "=== Multi-task all-suites: ${#SUITES[@]} suites × ${#POLICIES[@]} policies = ${TOTAL_JOBS} jobs ==="
+TOTAL_JOBS=$(( ${#POLICIES[@]} * ${#SUITES[@]} * ${#BATCH_SIZES[@]} * ${#LRS[@]} ))
+echo "=== Multi-task HP sweep: ${#POLICIES[@]} policies × ${#SUITES[@]} suites × ${#BATCH_SIZES[@]} bs × ${#LRS[@]} lr = ${TOTAL_JOBS} jobs ==="
 echo "GPUs: ${GPUS[*]}"
 echo "Parallel workers: ${PARALLEL}"
 echo ""
@@ -182,14 +182,16 @@ echo ""
 
 if [[ -n "${DRY_RUN:-}" ]]; then
     env_parallel -P "${PARALLEL}" \
-        run_task {1} {2} {#} \
-        ::: "${POLICIES[@]}" ::: "${SUITES[@]}"
+        run_task {1} {2} {3} {4} {#} \
+        ::: "${POLICIES[@]}" ::: "${SUITES[@]}" \
+        ::: "${BATCH_SIZES[@]}" ::: "${LRS[@]}"
 else
     env_parallel --bar \
         --results "${RESULTS_DIR}/logs" \
         -P "${PARALLEL}" \
-        run_task {1} {2} {#} \
-        ::: "${POLICIES[@]}" ::: "${SUITES[@]}"
+        run_task {1} {2} {3} {4} {#} \
+        ::: "${POLICIES[@]}" ::: "${SUITES[@]}" \
+        ::: "${BATCH_SIZES[@]}" ::: "${LRS[@]}"
 fi
 
 echo ""
