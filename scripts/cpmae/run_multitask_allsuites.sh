@@ -124,7 +124,8 @@ run_task() {
             --policy.optimizer_lr_backbone="$LR"
             --output_dir="$run_dir"
             --job_name="$run_name"
-            --wandb.enable=false
+            --wandb.enable=true
+            --wandb.project=cpmae_multitask
             --policy.push_to_hub=false
         )
     elif [[ "$policy" == "dp" ]]; then
@@ -150,7 +151,8 @@ run_task() {
             --policy.optimizer_lr="$LR"
             --output_dir="$run_dir"
             --job_name="$run_name"
-            --wandb.enable=false
+            --wandb.enable=true
+            --wandb.project=cpmae_multitask
             --policy.push_to_hub=false
         )
     fi
