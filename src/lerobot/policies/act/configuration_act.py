@@ -138,6 +138,7 @@ class ACTConfig(PreTrainedConfig):
     # Multi-task conditioning.
     num_tasks: int | None = None  # None = single-task (original behavior)
     task_embed_dim: int = 64  # Task embedding dimension
+    task_index_offset: int = 0  # Subtracted from task_index before embedding lookup (for per-suite training)
     use_task_film_on_vision: bool = False  # Ablation: FiLM on vision features
 
     # Training and loss computation.

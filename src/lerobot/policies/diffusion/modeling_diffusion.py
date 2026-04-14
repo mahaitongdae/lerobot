@@ -298,7 +298,7 @@ class DiffusionModel(nn.Module):
             # Canonicalize: ensure (B,) LongTensor
             if task_index.dim() == 2:
                 task_index = task_index.squeeze(-1)
-            task_index = task_index.long()
+            task_index = task_index.long() - self.config.task_index_offset
             task_emb = self.task_embedding(task_index)  # (B, task_embed_dim)
             global_cond = torch.cat([global_cond, task_emb], dim=-1)
 
