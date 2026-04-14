@@ -228,9 +228,27 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     # On real-world data, no need to create an environment as evaluations are done outside train.py,
     # using the eval.py instead, with gym_dora environment and dora-rs.
     eval_env = None
+    dataset_task_index_map = None
     if cfg.eval_freq > 0 and cfg.env is not None and is_main_process:
         logging.info("Creating env")
         eval_env = make_env(cfg.env, n_envs=cfg.eval.batch_size, use_async_envs=cfg.eval.use_async_envs)
+        # Build dataset_task_index_map for multi-task eval (LIBERO only)
+        if (
+            isinstance(eval_env, dict)
+            and getattr(cfg.policy, "num_tasks", None) is not None
+        ):
+            try:
+                from lerobot.envs.libero import build_dataset_task_index_map
+
+                dataset_task_index_map = build_dataset_task_index_map(
+                    eval_env, dataset.meta.tasks
+                )
+                logging.info("Built dataset_task_index_map: %s", dataset_task_index_map)
+            except Exception:
+                logging.warning(
+                    "Could not build dataset_task_index_map; eval will run without task conditioning",
+                    exc_info=True,
+                )
 
     if is_main_process:
         logging.info("Creating policy")
@@ -502,6 +520,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                         max_episodes_rendered=4,
                         start_seed=cfg.seed,
                         max_parallel_tasks=cfg.env.max_parallel_tasks,
+                        dataset_task_index_map=dataset_task_index_map,
                     )
                 # overall metrics (suite-agnostic)
                 aggregated = eval_info["overall"]

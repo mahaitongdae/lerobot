@@ -135,6 +135,11 @@ class ACTConfig(PreTrainedConfig):
     # Note: the value used in ACT when temporal ensembling is enabled is 0.01.
     temporal_ensemble_coeff: float | None = None
 
+    # Multi-task conditioning.
+    num_tasks: int | None = None  # None = single-task (original behavior)
+    task_embed_dim: int = 64  # Task embedding dimension
+    use_task_film_on_vision: bool = False  # Ablation: FiLM on vision features
+
     # Training and loss computation.
     dropout: float = 0.1
     kl_weight: float = 10.0

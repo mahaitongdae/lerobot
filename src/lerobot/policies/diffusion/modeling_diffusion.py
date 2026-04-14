@@ -90,12 +90,17 @@ class DiffusionPolicy(PreTrainedPolicy):
             self._queues[OBS_IMAGES] = deque(maxlen=self.config.n_obs_steps)
         if self.config.env_state_feature:
             self._queues[OBS_ENV_STATE] = deque(maxlen=self.config.n_obs_steps)
+        # Cache task_index for multi-task inference (not time-stacked, just latest).
+        self._cached_task_index = None
 
     @torch.no_grad()
     def predict_action_chunk(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:
         """Predict a chunk of actions given environment observations."""
         # stack n latest observations from the queue
         batch = {k: torch.stack(list(self._queues[k]), dim=1) for k in batch if k in self._queues}
+        # Inject cached task_index for multi-task inference.
+        if self._cached_task_index is not None:
+            batch["task_index"] = self._cached_task_index
         actions = self.diffusion.generate_actions(batch, noise=noise)
 
         return actions
@@ -125,6 +130,10 @@ class DiffusionPolicy(PreTrainedPolicy):
         # NOTE: for offline evaluation, we have action in the batch, so we need to pop it out
         if ACTION in batch:
             batch.pop(ACTION)
+
+        # Cache task_index for multi-task inference (not queued, just latest value).
+        if "task_index" in batch:
+            self._cached_task_index = batch["task_index"]
 
         if self.config.image_features:
             batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
@@ -181,7 +190,16 @@ class DiffusionModel(nn.Module):
         if self.config.env_state_feature:
             global_cond_dim += self.config.env_state_feature.shape[0]
 
-        self.unet = DiffusionConditionalUnet1d(config, global_cond_dim=global_cond_dim * config.n_obs_steps)
+        # Multi-task conditioning: task embedding appended AFTER time-flatten
+        # so it's not multiplied by n_obs_steps.
+        unet_global_cond_dim = global_cond_dim * config.n_obs_steps
+        if config.num_tasks is not None:
+            self.task_embedding = nn.Embedding(config.num_tasks, config.task_embed_dim)
+            unet_global_cond_dim += config.task_embed_dim
+        else:
+            self.task_embedding = None
+
+        self.unet = DiffusionConditionalUnet1d(config, global_cond_dim=unet_global_cond_dim)
 
         self.noise_scheduler = _make_noise_scheduler(
             config.noise_scheduler_type,
@@ -271,8 +289,20 @@ class DiffusionModel(nn.Module):
         if self.config.env_state_feature:
             global_cond_feats.append(batch[OBS_ENV_STATE])
 
-        # Concatenate features then flatten to (B, global_cond_dim).
-        return torch.cat(global_cond_feats, dim=-1).flatten(start_dim=1)
+        # Concatenate per-step features then flatten to (B, per_step_dim * n_obs_steps).
+        global_cond = torch.cat(global_cond_feats, dim=-1).flatten(start_dim=1)
+
+        # Append task embedding AFTER time-flatten (not multiplied by n_obs_steps).
+        if self.task_embedding is not None:
+            task_index = batch["task_index"]
+            # Canonicalize: ensure (B,) LongTensor
+            if task_index.dim() == 2:
+                task_index = task_index.squeeze(-1)
+            task_index = task_index.long()
+            task_emb = self.task_embedding(task_index)  # (B, task_embed_dim)
+            global_cond = torch.cat([global_cond, task_emb], dim=-1)
+
+        return global_cond
 
     def generate_actions(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:
         """

@@ -102,6 +102,7 @@ def rollout(
     seeds: list[int] | None = None,
     return_observations: bool = False,
     render_callback: Callable[[gym.vector.VectorEnv], None] | None = None,
+    dataset_task_index: int | None = None,
 ) -> dict:
     """Run a batched policy rollout once through a batch of environments.
 
@@ -171,6 +172,12 @@ def rollout(
 
         # Apply environment-specific preprocessing (e.g., LiberoProcessorStep for LIBERO)
         observation = env_preprocessor(observation)
+
+        # Inject dataset task_index for multi-task policies.
+        if dataset_task_index is not None:
+            observation["task_index"] = torch.full(
+                (env.num_envs,), dataset_task_index, dtype=torch.long
+            )
 
         observation = preprocessor(observation)
         with torch.inference_mode():
@@ -259,6 +266,7 @@ def eval_policy(
     videos_dir: Path | None = None,
     return_episode_data: bool = False,
     start_seed: int | None = None,
+    dataset_task_index: int | None = None,
 ) -> dict:
     """
     Args:
@@ -346,6 +354,7 @@ def eval_policy(
             seeds=list(seeds) if seeds else None,
             return_observations=return_episode_data,
             render_callback=render_frame if max_episodes_rendered > 0 else None,
+            dataset_task_index=dataset_task_index,
         )
 
         # Figure out where in each rollout sequence the first done condition was encountered (results after
@@ -603,6 +612,7 @@ def eval_one(
     videos_dir: Path | None,
     return_episode_data: bool,
     start_seed: int | None,
+    dataset_task_index: int | None = None,
 ) -> TaskMetrics:
     """Evaluates one task_id of one suite using the provided vec env."""
 
@@ -620,6 +630,7 @@ def eval_one(
         videos_dir=task_videos_dir,
         return_episode_data=return_episode_data,
         start_seed=start_seed,
+        dataset_task_index=dataset_task_index,
     )
 
     per_episode = task_result["per_episode"]
@@ -646,6 +657,7 @@ def run_one(
     videos_dir: Path | None,
     return_episode_data: bool,
     start_seed: int | None,
+    dataset_task_index: int | None = None,
 ):
     """
     Run eval_one for a single (task_group, task_id, env).
@@ -670,6 +682,7 @@ def run_one(
         videos_dir=task_videos_dir,
         return_episode_data=return_episode_data,
         start_seed=start_seed,
+        dataset_task_index=dataset_task_index,
     )
     # ensure we always provide video_paths key to simplify accumulation
     if max_episodes_rendered > 0:
@@ -691,6 +704,7 @@ def eval_policy_all(
     return_episode_data: bool = False,
     start_seed: int | None = None,
     max_parallel_tasks: int = 1,
+    dataset_task_index_map: dict[tuple[str, int], int] | None = None,
 ) -> dict:
     """
     Evaluate a nested `envs` dict: {task_group: {task_id: vec_env}}.
@@ -752,7 +766,8 @@ def eval_policy_all(
         # sequential path (single accumulator path on the main thread)
         # NOTE: keeping a single-threaded accumulator avoids concurrent list appends or locks
         for task_group, task_id, env in tasks:
-            tg, tid, metrics = task_runner(task_group, task_id, env)
+            ds_idx = dataset_task_index_map.get((task_group, task_id)) if dataset_task_index_map else None
+            tg, tid, metrics = task_runner(task_group, task_id, env, dataset_task_index=ds_idx)
             _accumulate_to(tg, metrics)
             per_task_infos.append({"task_group": tg, "task_id": tid, "metrics": metrics})
     else:
@@ -760,7 +775,8 @@ def eval_policy_all(
         with cf.ThreadPoolExecutor(max_workers=max_parallel_tasks) as executor:
             fut2meta = {}
             for task_group, task_id, env in tasks:
-                fut = executor.submit(task_runner, task_group, task_id, env)
+                ds_idx = dataset_task_index_map.get((task_group, task_id)) if dataset_task_index_map else None
+                fut = executor.submit(task_runner, task_group, task_id, env, dataset_task_index=ds_idx)
                 fut2meta[fut] = (task_group, task_id)
             for fut in cf.as_completed(fut2meta):
                 tg, tid, metrics = fut.result()

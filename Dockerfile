@@ -2,7 +2,7 @@ FROM nvidia/cuda:12.8.0-runtime-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
     MUJOCO_GL=egl \
-    LIBERO_DATASET_PATH=/app/libero_dataset \
+    LIBERO_CONFIG_PATH=/libero_data/libero_config \
     CMAKE_POLICY_VERSION_MINIMUM=3.5 \
     PATH="/root/.local/bin:${PATH}"
 
@@ -18,12 +18,24 @@ RUN pipx install nvitop
 
 WORKDIR /app
 
-RUN python -m pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir lerobot==0.4.4 && \
-    pip install --no-cache-dir libero==0.1.1 --use-pep517 --no-build-isolation
+# RUN python -m pip install --no-cache-dir --upgrade pip && \
+#     pip install --no-cache-dir robosuite==1.4.0 && \
+#     pip install --no-cache-dir libero==0.1.1 --use-pep517 --no-build-isolation
 
-RUN git clone --branch dev --single-branch --depth 1 \
+RUN python -m pip install --no-cache-dir --upgrade pip && \
+    git clone --branch dev --single-branch --depth 1 \
     https://github.com/mahaitongdae/lerobot.git . && \
-    pip install --no-cache-dir -e .
+    pip install --no-cache-dir -e . && \
+    pip install --no-cache-dir libero==0.1.1 --use-pep517 --no-build-isolation && \
+    pip install --no-cache-dir huggingface_hub==0.36.2 transformers==4.57.3 && \
+    pip install torch==2.7.0 torchvision==0.22.0 torchaudio==2.7.0 --index-url https://download.pytorch.org/whl/cu128
+
+RUN mkdir -p /libero_data/libero_config \
+    && printf "assets: /usr/local/lib/python3.10/dist-packages/libero/libero/./assets\n\
+bddl_files: /usr/local/lib/python3.10/dist-packages/libero/libero/./bddl_files\n\
+benchmark_root: /usr/local/lib/python3.10/dist-packages/libero/libero/./benchmark\n\
+datasets: /usr/local/lib/python3.10/dist-packages/libero/libero/../datasets\n\
+init_states: /usr/local/lib/python3.10/dist-packages/libero/libero/./init_files\n" \
+    > /libero_data/libero_config/config.yaml
 
 CMD ["/bin/bash"]

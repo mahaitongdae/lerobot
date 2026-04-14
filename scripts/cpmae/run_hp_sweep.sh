@@ -27,7 +27,7 @@ REPO_ID="HuggingFaceVLA/libero"
 
 BATCH_SIZES=(16 32 64)
 LRS=(1e-4 5e-5 1e-5)
-TASK_INDICES=(0 10 20 30)
+TASK_INDICES=(1 11)
 
 mkdir -p "$RESULTS_DIR"
 

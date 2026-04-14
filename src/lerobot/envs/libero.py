@@ -450,3 +450,34 @@ def create_libero_envs(
 
     # return plain dicts for predictability
     return {suite: dict(task_map) for suite, task_map in out.items()}
+
+
+def build_dataset_task_index_map(
+    envs: dict[str, dict[int, Any]],
+    dataset_tasks: Mapping,
+) -> dict[tuple[str, int], int]:
+    """Build a mapping from (suite_name, env_task_id) to dataset task_index.
+
+    Args:
+        envs: The nested env dict returned by create_libero_envs.
+        dataset_tasks: DataFrame with task names as index and 'task_index' column
+            (i.e., dataset.meta.tasks).
+
+    Returns:
+        Dict mapping (suite_name, env_task_id) -> dataset_task_index.
+        Only includes entries where a match was found.
+    """
+    # Build a lookup: normalized task name -> dataset task_index
+    name_to_idx: dict[str, int] = {}
+    for task_name, row in dataset_tasks.iterrows():
+        name_to_idx[task_name.strip().lower()] = int(row["task_index"])
+
+    mapping: dict[tuple[str, int], int] = {}
+    for suite_name, task_dict in envs.items():
+        suite = _get_suite(suite_name)
+        for tid in task_dict:
+            lang = suite.get_task(tid).language.strip().lower()
+            if lang in name_to_idx:
+                mapping[(suite_name, tid)] = name_to_idx[lang]
+
+    return mapping

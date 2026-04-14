@@ -444,6 +444,26 @@ class ACT(nn.Module):
         if self.config.image_features:
             self.encoder_cam_feat_pos_embed = ACTSinusoidalPositionEmbedding2d(config.dim_model // 2)
 
+        # Multi-task conditioning: task token in encoder input.
+        if config.num_tasks is not None:
+            self.task_embedding = nn.Embedding(config.num_tasks, config.task_embed_dim)
+            self.encoder_task_proj = nn.Linear(config.task_embed_dim, config.dim_model)
+            # Separate positional embedding for the task token (does not resize existing table).
+            self.task_pos_embed = nn.Embedding(1, config.dim_model)
+            # Optional FiLM on vision features (ablation only).
+            if config.use_task_film_on_vision and config.image_features:
+                film_proj = nn.Linear(config.task_embed_dim, 2 * config.dim_model)
+                nn.init.zeros_(film_proj.weight)
+                nn.init.zeros_(film_proj.bias)
+                self.task_film_proj = film_proj
+            else:
+                self.task_film_proj = None
+        else:
+            self.task_embedding = None
+            self.encoder_task_proj = None
+            self.task_pos_embed = None
+            self.task_film_proj = None
+
         # Transformer decoder.
         # Learnable positional embedding for the transformer's decoder (in the style of DETR object queries).
         self.decoder_pos_embed = nn.Embedding(config.chunk_size, config.dim_model)
@@ -549,6 +569,19 @@ class ACT(nn.Module):
         if self.config.env_state_feature:
             encoder_in_tokens.append(self.encoder_env_state_input_proj(batch[OBS_ENV_STATE]))
 
+        # Multi-task: compute task embedding and insert task token.
+        task_emb = None
+        if self.task_embedding is not None:
+            task_index = batch["task_index"]
+            # Canonicalize: ensure (B,) LongTensor
+            if task_index.dim() == 2:
+                task_index = task_index.squeeze(-1)
+            task_index = task_index.long()
+            task_emb = self.task_embedding(task_index)  # (B, task_embed_dim)
+            task_token = self.encoder_task_proj(task_emb)  # (B, dim_model)
+            encoder_in_tokens.append(task_token)
+            encoder_in_pos_embed.append(self.task_pos_embed.weight[0].unsqueeze(0))  # (1, D)
+
         if self.config.image_features:
             # For a list of images, the H and W may vary but H*W is constant.
             # NOTE: If modifying this section, verify on MPS devices that
@@ -557,6 +590,13 @@ class ACT(nn.Module):
                 cam_features = self.backbone(img)["feature_map"]
                 cam_pos_embed = self.encoder_cam_feat_pos_embed(cam_features).to(dtype=cam_features.dtype)
                 cam_features = self.encoder_img_feat_input_proj(cam_features)
+
+                # Optional FiLM on vision features (ablation).
+                if self.task_film_proj is not None and task_emb is not None:
+                    gamma_beta = self.task_film_proj(task_emb)  # (B, 2*D)
+                    gamma, beta = gamma_beta.chunk(2, dim=-1)  # (B, D) each
+                    # cam_features is (B, D, H, W) — reshape for broadcast
+                    cam_features = (1 + gamma[:, :, None, None]) * cam_features + beta[:, :, None, None]
 
                 # Rearrange features to (sequence, batch, dim).
                 cam_features = einops.rearrange(cam_features, "b c h w -> (h w) b c")

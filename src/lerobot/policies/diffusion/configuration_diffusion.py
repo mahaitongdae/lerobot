@@ -140,6 +140,10 @@ class DiffusionConfig(PreTrainedConfig):
     clip_sample: bool = True
     clip_sample_range: float = 1.0
 
+    # Multi-task conditioning.
+    num_tasks: int | None = None  # None = single-task (original behavior)
+    task_embed_dim: int = 64  # Task embedding dimension
+
     # Inference
     num_inference_steps: int | None = None
 
