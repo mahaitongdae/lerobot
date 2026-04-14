@@ -26,7 +26,7 @@ PARALLEL=$((NUM_EACH_GPU * ${#GPUS[@]}))
 # ── Hyperparameters (fixed) ────────────────────────────────────────
 STEPS=100000
 EVAL_FREQ=0
-SAVE_FREQ=50000
+SAVE_FREQ=25000
 N_EVAL_EPISODES=20
 EVAL_BATCH=10
 BATCH_SIZE=32
