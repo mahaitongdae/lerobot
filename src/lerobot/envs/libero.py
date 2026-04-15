@@ -235,6 +235,21 @@ class LiberoEnv(gym.Env):
             "camera_heights": self.observation_height,
             "camera_widths": self.observation_width,
         }
+
+        # Direct EGL rendering to the correct GPU.
+        # EGL device ordering does NOT match CUDA device ordering.
+        # Use RENDER_GPU_DEVICE_ID env var (the correct EGL index) if set,
+        # otherwise fall back to CUDA_VISIBLE_DEVICES (may land on wrong GPU).
+        render_device = os.environ.get("RENDER_GPU_DEVICE_ID", "")
+        if render_device and render_device.isdigit():
+            env_args["render_gpu_device_id"] = int(render_device)
+        else:
+            cuda_vis = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+            if cuda_vis:
+                gpu_ids = [int(x) for x in cuda_vis.split(",") if x.strip().isdigit()]
+                if gpu_ids:
+                    env_args["render_gpu_device_id"] = gpu_ids[0]
+
         env = OffScreenRenderEnv(**env_args)
         env.reset()
         return env

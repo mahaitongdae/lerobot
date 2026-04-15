@@ -508,6 +508,9 @@ class DiffusionRgbEncoder(nn.Module):
                 func=lambda x: nn.GroupNorm(num_groups=x.num_features // 16, num_channels=x.num_features),
             )
 
+        if config.freeze_backbone:
+            self.backbone.requires_grad_(False)
+
         # Set up pooling and final layers.
         # Use a dry run to get the feature map shape.
         # The dummy input should take the number of image channels from `config.image_features` and it should

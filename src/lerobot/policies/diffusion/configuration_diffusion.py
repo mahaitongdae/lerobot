@@ -63,6 +63,7 @@ class DiffusionConfig(PreTrainedConfig):
             `None` means no pretrained weights.
         use_group_norm: Whether to replace batch normalization with group normalization in the backbone.
             The group sizes are set to be about 16 (to be precise, feature_dim // 16).
+        freeze_backbone: If True, freeze vision backbone weights during training (no gradient updates).
         spatial_softmax_num_keypoints: Number of keypoints for SpatialSoftmax.
         use_separate_rgb_encoders_per_camera: Whether to use a separate RGB encoder for each camera view.
         down_dims: Feature dimension for each stage of temporal downsampling in the diffusion modeling Unet.
@@ -122,6 +123,7 @@ class DiffusionConfig(PreTrainedConfig):
     # Requires use_group_norm=False to preserve BatchNorm weights from SSL pretraining.
     ssl_checkpoint_path: str | None = None
     use_group_norm: bool = True
+    freeze_backbone: bool = False
     spatial_softmax_num_keypoints: int = 32
     use_separate_rgb_encoder_per_camera: bool = False
     # Unet.

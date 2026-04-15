@@ -557,6 +557,26 @@ def eval_main(cfg: EvalPipelineConfig):
     # Create environment-specific preprocessor and postprocessor (e.g., for LIBERO environments)
     env_preprocessor, env_postprocessor = make_env_pre_post_processors(env_cfg=cfg.env, policy_cfg=cfg.policy)
 
+    # Build dataset_task_index_map for multi-task eval
+    dataset_task_index_map = None
+    if (
+        cfg.dataset_repo_id
+        and isinstance(envs, dict)
+        and getattr(policy.config, "num_tasks", None) is not None
+    ):
+        try:
+            from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
+            from lerobot.envs.libero import build_dataset_task_index_map
+
+            meta = LeRobotDatasetMetadata(cfg.dataset_repo_id)
+            dataset_task_index_map = build_dataset_task_index_map(envs, meta.tasks)
+            logging.info("Built dataset_task_index_map for eval: %s", dataset_task_index_map)
+        except Exception:
+            logging.warning(
+                "Could not build dataset_task_index_map; eval will run without task conditioning",
+                exc_info=True,
+            )
+
     with torch.no_grad(), torch.autocast(device_type=device.type) if cfg.policy.use_amp else nullcontext():
         info = eval_policy_all(
             envs=envs,
@@ -570,6 +590,7 @@ def eval_main(cfg: EvalPipelineConfig):
             videos_dir=Path(cfg.output_dir) / "videos",
             start_seed=cfg.seed,
             max_parallel_tasks=cfg.env.max_parallel_tasks,
+            dataset_task_index_map=dataset_task_index_map,
         )
         print("Overall Aggregated Metrics:")
         print(info["overall"])
