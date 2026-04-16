@@ -1,7 +1,8 @@
-"""Utility for loading self-supervised pretrained ResNet weights (MoCo, SimCLR, BYOL, etc.)."""
+"""Utility for loading self-supervised pretrained weights (ResNet SSL and MoCo v3 ViT)."""
 
 import logging
 import os
+import re
 from pathlib import Path
 
 import torch
@@ -136,3 +137,111 @@ def load_ssl_weights_into_resnet(backbone_model: nn.Module, checkpoint_path: str
     )
     if missing:
         logger.debug("Missing keys (expected for fc/head): %s", missing)
+
+
+# ── MoCo v3 ViT support ─────────────────────────────────────────────
+
+_MOCOV3_KEY_MAP = {
+    "cls_token": "class_token",
+    "pos_embed": "encoder.pos_embedding",
+    "patch_embed.proj.weight": "conv_proj.weight",
+    "patch_embed.proj.bias": "conv_proj.bias",
+    "norm.weight": "encoder.ln.weight",
+    "norm.bias": "encoder.ln.bias",
+}
+
+_MOCOV3_BLOCK_RE = re.compile(r"^blocks\.(\d+)\.(.*)")
+
+_MOCOV3_BLOCK_KEY_MAP = {
+    "norm1.weight": "ln_1.weight",
+    "norm1.bias": "ln_1.bias",
+    "norm2.weight": "ln_2.weight",
+    "norm2.bias": "ln_2.bias",
+    "attn.qkv.weight": "self_attention.in_proj_weight",
+    "attn.qkv.bias": "self_attention.in_proj_bias",
+    "attn.proj.weight": "self_attention.out_proj.weight",
+    "attn.proj.bias": "self_attention.out_proj.bias",
+    "mlp.fc1.weight": "mlp.0.weight",
+    "mlp.fc1.bias": "mlp.0.bias",
+    "mlp.fc2.weight": "mlp.3.weight",
+    "mlp.fc2.bias": "mlp.3.bias",
+}
+
+
+def _remap_mocov3_to_torchvision(state_dict: dict) -> dict:
+    """Remap timm-style ViT keys (MoCo v3 checkpoint) to torchvision VisionTransformer keys."""
+    remapped = {}
+    for key, val in state_dict.items():
+        if key in _MOCOV3_KEY_MAP:
+            remapped[_MOCOV3_KEY_MAP[key]] = val
+            continue
+
+        m = _MOCOV3_BLOCK_RE.match(key)
+        if m:
+            block_idx, suffix = m.group(1), m.group(2)
+            if suffix in _MOCOV3_BLOCK_KEY_MAP:
+                tv_key = f"encoder.layers.encoder_layer_{block_idx}.{_MOCOV3_BLOCK_KEY_MAP[suffix]}"
+                remapped[tv_key] = val
+                continue
+
+        if any(frag in key for frag in _HEAD_KEY_FRAGMENTS):
+            continue
+
+        logger.debug("MoCo v3 key skipped (no mapping): %s", key)
+
+    return remapped
+
+
+def load_mocov3_weights_into_vit(vit_model: nn.Module, checkpoint_path: str) -> None:
+    """Load MoCo v3 pretrained weights into a torchvision VisionTransformer.
+
+    The MoCo v3 checkpoint uses timm-style key names (``blocks.0.attn.qkv.weight``)
+    while torchvision uses ``encoder.layers.encoder_layer_0.self_attention.in_proj_weight``.
+    This function handles the key remapping automatically.
+
+    Args:
+        vit_model: A ``torchvision.models.vision_transformer.VisionTransformer`` instance.
+        checkpoint_path: Local file path or HTTP(S) URL to the MoCo v3 ``.pth.tar`` checkpoint.
+
+    Raises:
+        FileNotFoundError: If a local path does not exist.
+        RuntimeError: If no backbone keys could be matched.
+    """
+    if checkpoint_path.startswith(("http://", "https://")):
+        ckpt = torch.hub.load_state_dict_from_url(checkpoint_path, map_location="cpu")
+    else:
+        path = Path(checkpoint_path).expanduser()
+        if not path.is_file():
+            raise FileNotFoundError(f"MoCo v3 checkpoint not found: {path}")
+        ckpt = torch.load(str(path), map_location="cpu", weights_only=False)
+
+    raw_sd = _extract_state_dict(ckpt)
+
+    # Strip the MoCo v3 wrapper prefix (module.base_encoder.)
+    prefix = "module.base_encoder."
+    stripped = {k[len(prefix):]: v for k, v in raw_sd.items() if k.startswith(prefix)}
+    if not stripped:
+        stripped = _filter_head_keys(raw_sd)
+
+    remapped = _remap_mocov3_to_torchvision(stripped)
+
+    target_keys = set(vit_model.state_dict().keys())
+    remapped = {k: v for k, v in remapped.items() if k in target_keys}
+
+    if len(remapped) == 0:
+        sample_keys = list(raw_sd.keys())[:10]
+        raise RuntimeError(
+            f"Could not match any MoCo v3 checkpoint keys to the ViT backbone. "
+            f"Sample checkpoint keys: {sample_keys}"
+        )
+
+    missing, unexpected = vit_model.load_state_dict(remapped, strict=False)
+    logger.info(
+        "Loaded MoCo v3 ViT weights from %s. matched=%d, missing=%d, unexpected=%d",
+        os.path.basename(checkpoint_path) if not checkpoint_path.startswith("http") else checkpoint_path,
+        len(remapped),
+        len(missing),
+        len(unexpected),
+    )
+    if missing:
+        logger.debug("Missing keys (expected for heads): %s", missing)

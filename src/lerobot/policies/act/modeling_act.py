@@ -42,7 +42,7 @@ except ImportError:
 from lerobot.policies.act.configuration_act import ACTConfig
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
-from lerobot.utils.ssl_backbone import load_ssl_weights_into_resnet
+from lerobot.utils.ssl_backbone import load_mocov3_weights_into_vit, load_ssl_weights_into_resnet
 
 
 class SiglipBackboneWrapper(nn.Module):
@@ -102,6 +102,66 @@ class Dinov2BackboneWrapper(nn.Module):
             x = F.interpolate(x, size=(self.image_size, self.image_size), mode="bilinear", align_corners=False)
         out = self.vision_model(pixel_values=x)
         patches = out.last_hidden_state[:, 1:]  # strip CLS token → (B, num_patches, hidden_size)
+        feature_map = einops.rearrange(
+            patches, "b (h w) c -> b c h w", h=self.grid_size, w=self.grid_size
+        )
+        return {"feature_map": feature_map}
+
+
+class MoCoV3BackboneWrapper(nn.Module):
+    """Wraps a torchvision VisionTransformer loaded with MoCo v3 pretrained weights.
+
+    Produces 2D feature maps by stripping the CLS token and reshaping the patch tokens
+    to (B, hidden_dim, H, W), matching the ResNet backbone interface used by ACT.
+
+    ViT-S/16 (default): hidden_dim=384, 12 layers, 12 heads, mlp_dim=1536, 224px input.
+    """
+
+    PRESETS = {
+        "vit_small": {"hidden_dim": 384, "num_layers": 12, "num_heads": 12, "mlp_dim": 1536},
+        "vit_base": {"hidden_dim": 768, "num_layers": 12, "num_heads": 12, "mlp_dim": 3072},
+    }
+
+    def __init__(
+        self,
+        checkpoint_path: str,
+        arch: str = "vit_small",
+        image_size: int = 224,
+        patch_size: int = 16,
+    ):
+        super().__init__()
+        from torchvision.models.vision_transformer import VisionTransformer
+
+        preset = self.PRESETS.get(arch)
+        if preset is None:
+            raise ValueError(f"Unknown MoCo v3 arch {arch!r}. Choose from {list(self.PRESETS)}")
+
+        self.vit = VisionTransformer(
+            image_size=image_size,
+            patch_size=patch_size,
+            num_classes=1000,
+            **preset,
+        )
+
+        load_mocov3_weights_into_vit(self.vit, checkpoint_path)
+
+        self.hidden_size = preset["hidden_dim"]
+        self.patch_size = patch_size
+        self.image_size = image_size
+        self.grid_size = image_size // patch_size
+
+    def forward(self, x: Tensor) -> dict[str, Tensor]:
+        if x.shape[-2:] != (self.image_size, self.image_size):
+            x = F.interpolate(x, size=(self.image_size, self.image_size), mode="bilinear", align_corners=False)
+
+        # Run through ViT internals to get patch features (skip classification head)
+        x = self.vit._process_input(x)  # (B, num_patches, hidden_dim)
+        n = x.shape[0]
+        batch_class_token = self.vit.class_token.expand(n, -1, -1)
+        x = torch.cat([batch_class_token, x], dim=1)
+        x = self.vit.encoder(x)  # (B, 1 + num_patches, hidden_dim)
+
+        patches = x[:, 1:]  # strip CLS token
         feature_map = einops.rearrange(
             patches, "b (h w) c -> b c h w", h=self.grid_size, w=self.grid_size
         )
@@ -399,6 +459,13 @@ class ACT(nn.Module):
                 dinov2_wrapper = Dinov2BackboneWrapper(config.dinov2_model_name)
                 self.backbone = dinov2_wrapper
                 backbone_out_channels = dinov2_wrapper.hidden_size
+            elif config.vision_backbone.startswith("mocov3"):
+                mocov3_wrapper = MoCoV3BackboneWrapper(
+                    checkpoint_path=config.mocov3_checkpoint_path,
+                    arch=config.mocov3_arch,
+                )
+                self.backbone = mocov3_wrapper
+                backbone_out_channels = mocov3_wrapper.hidden_size
             else:
                 backbone_model = getattr(torchvision.models, config.vision_backbone)(
                     replace_stride_with_dilation=[False, False, config.replace_final_stride_with_dilation],

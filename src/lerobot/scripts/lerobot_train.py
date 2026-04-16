@@ -364,6 +364,12 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         shuffle = False
         if dataset.episodes is not None:
             ep_col = dataset.hf_dataset["episode_index"]
+            if len(ep_col) == 0:
+                raise ValueError(
+                    f"Dataset has 0 frames after filtering for episodes {dataset.episodes[:5]}... "
+                    f"({len(dataset.episodes)} requested). The data files may not be downloaded yet. "
+                    f"Try re-running to trigger a fresh download."
+                )
             rel_from, rel_to = [], []
             prev_ep = None
             for i, ep in enumerate(ep_col):

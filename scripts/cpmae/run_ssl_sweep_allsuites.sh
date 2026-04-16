@@ -51,7 +51,7 @@ SSL_URLS[byol]="https://lightly-ssl-checkpoints.s3.amazonaws.com/imagenet_resnet
 # ── Suite & policy lists ──────────────────────────────────────────
 SUITES=(libero_10 libero_spatial libero_object libero_goal)
 POLICIES=(act dp)
-BACKBONES=(imagenet moco_v2 moco_v1 simclr byol)
+BACKBONES=(imagenet moco_v2 simclr byol)
 
 MAPPING_JSON="scripts/cpmae/task_mapping.json"
 

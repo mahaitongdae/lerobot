@@ -55,8 +55,8 @@ class ACTConfig(PreTrainedConfig):
         normalization_mapping: A dictionary that maps from a str value of FeatureType (e.g., "STATE", "VISUAL") to
             a corresponding NormalizationMode (e.g., NormalizationMode.MIN_MAX)
         vision_backbone: Name of the vision backbone to use for encoding images. Supports torchvision
-            ResNet variants (e.g. "resnet18"), "siglip" (requires `siglip_model_name`), or "dinov2"
-            (requires `dinov2_model_name`).
+            ResNet variants (e.g. "resnet18"), "siglip" (requires `siglip_model_name`), "dinov2"
+            (requires `dinov2_model_name`), or "mocov3" (requires `mocov3_checkpoint_path`).
         pretrained_backbone_weights: Pretrained weights from torchvision to initialize the backbone.
             `None` means no pretrained weights. Only used for ResNet backbones.
         replace_final_stride_with_dilation: Whether to replace the ResNet's final 2x2 stride with a dilated
@@ -65,6 +65,9 @@ class ACTConfig(PreTrainedConfig):
             Required when `vision_backbone` starts with "siglip".
         dinov2_model_name: HuggingFace model name for DINOv2 (e.g. "facebook/dinov2-small").
             Required when `vision_backbone` starts with "dinov2".
+        mocov3_checkpoint_path: Local path or URL to a MoCo v3 ViT checkpoint (.pth.tar).
+            Required when `vision_backbone` starts with "mocov3".
+        mocov3_arch: MoCo v3 ViT architecture variant ("vit_small" or "vit_base").
         freeze_backbone: If True, freeze vision backbone weights during training (no gradient updates).
         pre_norm: Whether to use "pre-norm" in the transformer blocks.
         dim_model: The transformer blocks' main hidden dimension.
@@ -114,6 +117,9 @@ class ACTConfig(PreTrainedConfig):
     siglip_model_name: str | None = None
     # DINOv2 backbone (used when vision_backbone starts with "dinov2").
     dinov2_model_name: str | None = None
+    # MoCo v3 ViT backbone (used when vision_backbone starts with "mocov3").
+    mocov3_checkpoint_path: str | None = None
+    mocov3_arch: str = "vit_small"
     freeze_backbone: bool = False
     # Transformer layers.
     pre_norm: bool = False
@@ -154,7 +160,7 @@ class ACTConfig(PreTrainedConfig):
         super().__post_init__()
 
         """Input validation (not exhaustive)."""
-        supported_prefixes = ("resnet", "siglip", "dinov2")
+        supported_prefixes = ("resnet", "siglip", "dinov2", "mocov3")
         if not any(self.vision_backbone.startswith(p) for p in supported_prefixes):
             raise ValueError(
                 f"`vision_backbone` must start with one of {supported_prefixes}. Got {self.vision_backbone}."
@@ -176,6 +182,11 @@ class ACTConfig(PreTrainedConfig):
             raise ValueError(
                 "`dinov2_model_name` must be set when using a DINOv2 vision backbone "
                 "(e.g. 'facebook/dinov2-small')."
+            )
+        if self.vision_backbone.startswith("mocov3") and not self.mocov3_checkpoint_path:
+            raise ValueError(
+                "`mocov3_checkpoint_path` must be set when using a MoCo v3 vision backbone "
+                "(e.g. 'https://dl.fbaipublicfiles.com/moco-v3/vit-s-300ep/vit-s-300ep.pth.tar')."
             )
         if self.temporal_ensemble_coeff is not None and self.n_action_steps > 1:
             raise NotImplementedError(

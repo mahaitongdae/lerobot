@@ -21,8 +21,8 @@ PARALLEL=$((NUM_EACH_GPU * ${#GPUS[@]}))
 
 # ── Eval parameters ───────────────────────────────────────────────
 N_EVAL_EPISODES=20       # per task (10 tasks => 200 total per checkpoint)
-EVAL_BATCH_ACT=5         # batch_size for ACT (198MB model, ~25GB total fits in 32GB)
-EVAL_BATCH_DP=2          # batch_size for DP  (1.1GB model, needs lower batch to fit)
+EVAL_BATCH_ACT=10         # batch_size for ACT (198MB model, ~25GB total fits in 32GB)
+EVAL_BATCH_DP=10          # batch_size for DP  (1.1GB model, needs lower batch to fit)
 SEED=42
 REPO_ID="HuggingFaceVLA/libero"
 RESULTS_DIR="results/multitask_allsuites"
