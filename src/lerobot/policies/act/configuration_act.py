@@ -56,7 +56,9 @@ class ACTConfig(PreTrainedConfig):
             a corresponding NormalizationMode (e.g., NormalizationMode.MIN_MAX)
         vision_backbone: Name of the vision backbone to use for encoding images. Supports torchvision
             ResNet variants (e.g. "resnet18"), "siglip" (requires `siglip_model_name`), "dinov2"
-            (requires `dinov2_model_name`), or "mocov3" (requires `mocov3_checkpoint_path`).
+            (requires `dinov2_model_name`), "mocov3" (requires `mocov3_checkpoint_path`),
+            "voltron" (requires `voltron_model_id` and the optional `voltron-robotics` package),
+            or "cpmae" (requires `cpmae_checkpoint_path`).
         pretrained_backbone_weights: Pretrained weights from torchvision to initialize the backbone.
             `None` means no pretrained weights. Only used for ResNet backbones.
         replace_final_stride_with_dilation: Whether to replace the ResNet's final 2x2 stride with a dilated
@@ -68,6 +70,10 @@ class ACTConfig(PreTrainedConfig):
         mocov3_checkpoint_path: Local path or URL to a MoCo v3 ViT checkpoint (.pth.tar).
             Required when `vision_backbone` starts with "mocov3".
         mocov3_arch: MoCo v3 ViT architecture variant ("vit_small" or "vit_base").
+        voltron_model_id: Voltron model id (e.g. "v-cond" for ViT-S, "v-cond-base" for ViT-B).
+            Required when `vision_backbone` starts with "voltron".
+        voltron_cache_dir: Local directory for the `voltron-robotics` package to cache
+            downloaded configs/checkpoints. Defaults to the package-internal "cache/" folder.
         freeze_backbone: If True, freeze vision backbone weights during training (no gradient updates).
         pre_norm: Whether to use "pre-norm" in the transformer blocks.
         dim_model: The transformer blocks' main hidden dimension.
@@ -120,6 +126,17 @@ class ACTConfig(PreTrainedConfig):
     # MoCo v3 ViT backbone (used when vision_backbone starts with "mocov3").
     mocov3_checkpoint_path: str | None = None
     mocov3_arch: str = "vit_small"
+    # Voltron backbone (used when vision_backbone starts with "voltron").
+    # Requires the optional `voltron-robotics` package.
+    voltron_model_id: str = "v-cond"
+    voltron_cache_dir: str | None = None
+    # CP-MAE backbone (used when vision_backbone starts with "cpmae").
+    cpmae_checkpoint_path: str | None = None
+    cpmae_img_size: int = 224
+    cpmae_patch_size: int = 16
+    cpmae_embed_dim: int = 384
+    cpmae_depth: int = 12
+    cpmae_n_heads: int = 6
     freeze_backbone: bool = False
     # Transformer layers.
     pre_norm: bool = False
@@ -160,7 +177,7 @@ class ACTConfig(PreTrainedConfig):
         super().__post_init__()
 
         """Input validation (not exhaustive)."""
-        supported_prefixes = ("resnet", "siglip", "dinov2", "mocov3")
+        supported_prefixes = ("resnet", "siglip", "dinov2", "mocov3", "voltron", "cpmae")
         if not any(self.vision_backbone.startswith(p) for p in supported_prefixes):
             raise ValueError(
                 f"`vision_backbone` must start with one of {supported_prefixes}. Got {self.vision_backbone}."
@@ -187,6 +204,16 @@ class ACTConfig(PreTrainedConfig):
             raise ValueError(
                 "`mocov3_checkpoint_path` must be set when using a MoCo v3 vision backbone "
                 "(e.g. 'https://dl.fbaipublicfiles.com/moco-v3/vit-s-300ep/vit-s-300ep.pth.tar')."
+            )
+        if self.vision_backbone.startswith("voltron") and not self.voltron_model_id:
+            raise ValueError(
+                "`voltron_model_id` must be set when using a Voltron vision backbone "
+                "(e.g. 'v-cond' or 'v-cond-base')."
+            )
+        if self.vision_backbone.startswith("cpmae") and not self.cpmae_checkpoint_path:
+            raise ValueError(
+                "`cpmae_checkpoint_path` must be set when using a CP-MAE vision backbone "
+                "(e.g. 'results/M3_cpmae/R200_cpmae/encoder_final.pt')."
             )
         if self.temporal_ensemble_coeff is not None and self.n_action_steps > 1:
             raise NotImplementedError(

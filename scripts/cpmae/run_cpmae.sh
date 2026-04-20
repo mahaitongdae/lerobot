@@ -34,6 +34,7 @@ RESULTS_DIR="results/M3_cpmae"
 REPO_ID="HuggingFaceVLA/libero"
 CONTACT_LABELS_DIR="results/contact_labels"
 SUITE="libero_10"
+MAPPING_JSON="scripts/cpmae/task_mapping.json"
 
 mkdir -p "$RESULTS_DIR"
 
@@ -44,73 +45,39 @@ cleanup() {
 }
 trap cleanup SIGINT SIGTERM
 
-# Helper functions
-resolve_episodes() {
-  local task_idx=$1
-  python3 -c "
-from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
-meta = LeRobotDatasetMetadata('$REPO_ID')
-task_name = meta.tasks[meta.tasks['task_index'] == $task_idx].index[0]
-eps = [ep['episode_index'] for ep in meta.episodes if task_name in ep['tasks']]
-print('[' + ','.join(str(e) for e in sorted(eps)) + ']')
-"
-}
+# Ensure task_mapping.json exists
+if [[ ! -f "$MAPPING_JSON" ]]; then
+  echo "Task mapping not found. Generating..."
+  python3 scripts/cpmae/build_task_mapping.py --output "$MAPPING_JSON"
+fi
+
+# Resolve multi-task metadata from task_mapping.json
+NUM_TASKS=$(python3 -c "import json; m=json.load(open('$MAPPING_JSON')); print(m['suites']['$SUITE']['num_tasks'])")
+ALL_EPISODES=$(python3 -c "import json; m=json.load(open('$MAPPING_JSON')); print('[' + ','.join(str(e) for e in m['suites']['$SUITE']['all_episodes']) + ']')")
+ENV_TASK_IDS=$(python3 -c "import json; m=json.load(open('$MAPPING_JSON')); print('[' + ','.join(str(e) for e in m['suites']['$SUITE']['env_task_ids']) + ']')")
+TASK_INDEX_OFFSET=$(python3 -c "import json; m=json.load(open('$MAPPING_JSON')); print(min(m['suites']['$SUITE']['dataset_task_indices']))")
+
+echo "Suite $SUITE: $NUM_TASKS tasks, offset=$TASK_INDEX_OFFSET"
 
 resolve_episodes_fraction() {
-  # Return a subset of episodes for sample efficiency study
-  local task_idx=$1 fraction=$2 seed=$3
+  # Return a fraction of episodes across all tasks (stratified by task)
+  local fraction=$1 seed=$2
   python3 -c "
-import random
+import json, random
 from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
+m = json.load(open('$MAPPING_JSON'))
+suite = m['suites']['$SUITE']
 meta = LeRobotDatasetMetadata('$REPO_ID')
-task_name = meta.tasks[meta.tasks['task_index'] == $task_idx].index[0]
-eps = sorted(ep['episode_index'] for ep in meta.episodes if task_name in ep['tasks'])
-random.seed($seed)
-n = max(1, int(len(eps) * $fraction))
-subset = sorted(random.sample(eps, n))
-print('[' + ','.join(str(e) for e in subset) + ']')
+sampled = []
+for task_idx in suite['dataset_task_indices']:
+    task_name = meta.tasks[meta.tasks['task_index'] == task_idx].index[0]
+    eps = sorted(ep['episode_index'] for ep in meta.episodes if task_name in ep['tasks'])
+    random.seed($seed + task_idx)
+    n = max(1, int(len(eps) * $fraction))
+    sampled.extend(random.sample(eps, n))
+print('[' + ','.join(str(e) for e in sorted(sampled)) + ']')
 "
 }
-
-resolve_env_task() {
-  local task_idx=$1
-  python3 -c "
-import sys, io, os
-os.environ['LIBERO_QUIET'] = '1'
-_real = sys.stdout; sys.stdout = io.StringIO()
-from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
-from libero.libero import benchmark
-meta = LeRobotDatasetMetadata('$REPO_ID')
-ds_tasks = {int(row['task_index']): name for name, row in meta.tasks.iterrows()}
-task_name = ds_tasks[$task_idx].strip().lower()
-for suite_name in ['$SUITE']:
-    suite = benchmark.get_benchmark_dict()[suite_name]()
-    for i in range(len(suite.tasks)):
-        if suite.get_task(i).language.strip().lower() == task_name:
-            sys.stdout = _real; print(i); exit()
-sys.stdout = _real; print(-1)
-"
-}
-
-# Get task indices
-TASK_INDICES=$(python3 -c "
-from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
-from libero.libero import benchmark
-import os, sys, io
-os.environ['LIBERO_QUIET'] = '1'
-_real = sys.stdout; sys.stdout = io.StringIO()
-suite = benchmark.get_benchmark_dict()['$SUITE']()
-meta = LeRobotDatasetMetadata('$REPO_ID')
-ds_tasks = {name.strip().lower(): int(row['task_index']) for name, row in meta.tasks.iterrows()}
-sys.stdout = _real
-indices = []
-for i in range(len(suite.tasks)):
-    task_name = suite.get_task(i).language.strip().lower()
-    if task_name in ds_tasks:
-        indices.append(ds_tasks[task_name])
-print(' '.join(str(x) for x in sorted(indices)))
-")
-echo "Suite $SUITE task_indices: $TASK_INDICES"
 
 # =========================================================================
 # Phase 1: Pretrain encoders (M3a)
@@ -184,14 +151,12 @@ DOWNSTREAM_EXPS=(
   "R213 umae false $UMAE_CKPT"
 )
 
-# Build job list: (run_id, encoder_name, freeze, ckpt, seed, task_idx)
+# Build job list: (run_id, encoder_name, freeze, ckpt, seed)
 ds_jobs=()
 for exp in "${DOWNSTREAM_EXPS[@]}"; do
   read -r run_id enc_name freeze ckpt <<< "$exp"
   for seed in "${SEEDS[@]}"; do
-    for task_idx in $TASK_INDICES; do
-      ds_jobs+=("$run_id|$enc_name|$freeze|$ckpt|$seed|$task_idx")
-    done
+    ds_jobs+=("$run_id|$enc_name|$freeze|$ckpt|$seed")
   done
 done
 
@@ -199,31 +164,31 @@ echo "Downstream jobs: ${#ds_jobs[@]}"
 
 run_downstream_job() {
   local job_str=$1 gpu=$2
-  IFS='|' read -r run_id enc_name freeze ckpt seed task_idx <<< "$job_str"
+  IFS='|' read -r run_id enc_name freeze ckpt seed <<< "$job_str"
 
-  local episodes=$(resolve_episodes "$task_idx")
-  local env_task_id=$(resolve_env_task "$task_idx")
   local freeze_str=$([ "$freeze" = "true" ] && echo "frozen" || echo "ft")
-  local run_dir="$RESULTS_DIR/${run_id}_${enc_name}_${freeze_str}/seed${seed}/task_${task_idx}"
+  local run_dir="$RESULTS_DIR/${run_id}_${enc_name}_${freeze_str}/seed${seed}"
 
   if [ -d "$run_dir/checkpoints/last/pretrained_model" ]; then
-    echo "[GPU $gpu] $run_id $enc_name $freeze_str seed=$seed task=$task_idx — completed, skipping"
+    echo "[GPU $gpu] $run_id $enc_name $freeze_str seed=$seed — completed, skipping"
     return 0
   fi
 
-  echo "[GPU $gpu] $run_id $enc_name $freeze_str seed=$seed task=$task_idx"
+  echo "[GPU $gpu] $run_id $enc_name $freeze_str seed=$seed (multi-task, $NUM_TASKS tasks)"
 
-  CUDA_VISIBLE_DEVICES=$gpu python3 scripts/cpmae/train_with_cpmae.py \
-    --cpmae_checkpoint="$ckpt" \
-    --cpmae_freeze=$freeze \
-    -- \
+  CUDA_VISIBLE_DEVICES=$gpu lerobot-train \
     --dataset.repo_id=$REPO_ID \
-    --dataset.episodes="$episodes" \
+    --dataset.episodes="$ALL_EPISODES" \
     --policy.type=act \
     --policy.vision_backbone=cpmae \
+    --policy.cpmae_checkpoint_path="$ckpt" \
+    --policy.freeze_backbone=$freeze \
+    --policy.num_tasks=$NUM_TASKS \
+    --policy.task_embed_dim=64 \
+    --policy.task_index_offset=$TASK_INDEX_OFFSET \
     --env.type=libero \
     --env.task=$SUITE \
-    --env.task_ids="[$env_task_id]" \
+    --env.task_ids="$ENV_TASK_IDS" \
     --batch_size=$ACT_BS \
     --steps=$STEPS \
     --eval_freq=$EVAL_FREQ \
@@ -234,7 +199,7 @@ run_downstream_job() {
     --policy.optimizer_lr=$ACT_LR \
     --policy.optimizer_lr_backbone=$ACT_LR \
     --output_dir="$run_dir" \
-    --job_name="${run_id}_${enc_name}_${freeze_str}_s${seed}_t${task_idx}" \
+    --job_name="${run_id}_${enc_name}_${freeze_str}_s${seed}" \
     --wandb.enable=true \
     --wandb.project=cpmae_downstream \
     --policy.push_to_hub=false
@@ -283,12 +248,9 @@ eff_jobs=()
 for exp in "${EFFICIENCY_EXPS[@]}"; do
   read -r run_base enc_name ckpt <<< "$exp"
   for frac in "${DATA_FRACTIONS[@]}"; do
-    # Compute run_id offset: R220 -> R220/R221/R222 for 10/25/50%
     frac_pct=$(python3 -c "print(int($frac * 100))")
     for seed in "${SEEDS[@]}"; do
-      for task_idx in $TASK_INDICES; do
-        eff_jobs+=("${run_base}_${frac_pct}pct|$enc_name|$ckpt|$frac|$seed|$task_idx")
-      done
+      eff_jobs+=("${run_base}_${frac_pct}pct|$enc_name|$ckpt|$frac|$seed")
     done
   done
 done
@@ -297,73 +259,50 @@ echo "Sample efficiency jobs: ${#eff_jobs[@]}"
 
 run_efficiency_job() {
   local job_str=$1 gpu=$2
-  IFS='|' read -r run_id enc_name ckpt frac seed task_idx <<< "$job_str"
+  IFS='|' read -r run_id enc_name ckpt frac seed <<< "$job_str"
 
-  local episodes=$(resolve_episodes_fraction "$task_idx" "$frac" "$seed")
-  local env_task_id=$(resolve_env_task "$task_idx")
-  local run_dir="$RESULTS_DIR/${run_id}/seed${seed}/task_${task_idx}"
+  local episodes=$(resolve_episodes_fraction "$frac" "$seed")
+  local run_dir="$RESULTS_DIR/${run_id}/seed${seed}"
 
   if [ -d "$run_dir/checkpoints/last/pretrained_model" ]; then
-    echo "[GPU $gpu] $run_id seed=$seed task=$task_idx — completed, skipping"
+    echo "[GPU $gpu] $run_id seed=$seed — completed, skipping"
     return 0
   fi
 
-  echo "[GPU $gpu] $run_id ($enc_name, ${frac}x data) seed=$seed task=$task_idx"
+  echo "[GPU $gpu] $run_id ($enc_name, ${frac}x data, multi-task) seed=$seed"
 
+  local vision_args=""
   if [ "$enc_name" = "cpmae" ] || [ "$enc_name" = "umae" ]; then
-    # CP-MAE or Uniform MAE — use train_with_cpmae.py wrapper
-    CUDA_VISIBLE_DEVICES=$gpu python3 scripts/cpmae/train_with_cpmae.py \
-      --cpmae_checkpoint="$ckpt" \
-      --cpmae_freeze=true \
-      -- \
-      --dataset.repo_id=$REPO_ID \
-      --dataset.episodes="$episodes" \
-      --policy.type=act \
-      --policy.vision_backbone=cpmae \
-      --env.type=libero \
-      --env.task=$SUITE \
-      --env.task_ids="[$env_task_id]" \
-      --batch_size=$ACT_BS \
-      --steps=$STEPS \
-      --eval_freq=$EVAL_FREQ \
-      --save_freq=$SAVE_FREQ \
-      --eval.n_episodes=$N_EVAL_EPISODES \
-      --eval.batch_size=$EVAL_BATCH \
-      --seed=$seed \
-      --policy.optimizer_lr=$ACT_LR \
-      --policy.optimizer_lr_backbone=$ACT_LR \
-      --output_dir="$run_dir" \
-      --job_name="${run_id}_s${seed}_t${task_idx}" \
-      --wandb.enable=true \
-      --wandb.project=cpmae_efficiency \
-      --policy.push_to_hub=false
+    vision_args="--policy.vision_backbone=cpmae --policy.cpmae_checkpoint_path=$ckpt --policy.freeze_backbone=true"
   else
-    # ImageNet ResNet18 baseline
-    CUDA_VISIBLE_DEVICES=$gpu lerobot-train \
-      --dataset.repo_id=$REPO_ID \
-      --dataset.episodes="$episodes" \
-      --policy.type=act \
-      --policy.vision_backbone=resnet18 \
-      --policy.pretrained_backbone_weights=ResNet18_Weights.IMAGENET1K_V1 \
-      --policy.freeze_backbone=true \
-      --env.type=libero \
-      --env.task=$SUITE \
-      --env.task_ids="[$env_task_id]" \
-      --batch_size=$ACT_BS \
-      --steps=$STEPS \
-      --eval_freq=$EVAL_FREQ \
-      --save_freq=$SAVE_FREQ \
-      --eval.n_episodes=$N_EVAL_EPISODES \
-      --eval.batch_size=$EVAL_BATCH \
-      --seed=$seed \
-      --policy.optimizer_lr=$ACT_LR \
-      --policy.optimizer_lr_backbone=$ACT_LR \
-      --output_dir="$run_dir" \
-      --job_name="${run_id}_s${seed}_t${task_idx}" \
-      --wandb.enable=true \
-      --wandb.project=cpmae_efficiency \
-      --policy.push_to_hub=false
+    vision_args="--policy.vision_backbone=resnet18 --policy.pretrained_backbone_weights=ResNet18_Weights.IMAGENET1K_V1 --policy.freeze_backbone=true"
   fi
+
+  CUDA_VISIBLE_DEVICES=$gpu lerobot-train \
+    --dataset.repo_id=$REPO_ID \
+    --dataset.episodes="$episodes" \
+    --policy.type=act \
+    $vision_args \
+    --policy.num_tasks=$NUM_TASKS \
+    --policy.task_embed_dim=64 \
+    --policy.task_index_offset=$TASK_INDEX_OFFSET \
+    --env.type=libero \
+    --env.task=$SUITE \
+    --env.task_ids="$ENV_TASK_IDS" \
+    --batch_size=$ACT_BS \
+    --steps=$STEPS \
+    --eval_freq=$EVAL_FREQ \
+    --save_freq=$SAVE_FREQ \
+    --eval.n_episodes=$N_EVAL_EPISODES \
+    --eval.batch_size=$EVAL_BATCH \
+    --seed=$seed \
+    --policy.optimizer_lr=$ACT_LR \
+    --policy.optimizer_lr_backbone=$ACT_LR \
+    --output_dir="$run_dir" \
+    --job_name="${run_id}_s${seed}" \
+    --wandb.enable=true \
+    --wandb.project=cpmae_efficiency \
+    --policy.push_to_hub=false
 }
 
 i=0

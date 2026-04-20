@@ -16,13 +16,16 @@ logger = logging.getLogger(__name__)
 #   MoCo v3: base_encoder is the gradient-trained encoder
 #   BYOL: online_encoder.net is the gradient-trained encoder (not the EMA target)
 #   SimCLR / solo-learn / VISSL: backbone / encoder / trunk contain the representation
+#   R3M / VIP: the ResNet lives under module.convnet (DataParallel-wrapped)
 _KNOWN_PREFIXES = [
     "module.encoder_q.",
     "module.base_encoder.",
+    "module.convnet.",
     "online_encoder.net.",
     "trunk._feature_blocks.",
     "_feature_blocks.",
     "base_model.",
+    "convnet.",
     "backbone.",
     "encoder.",
     "trunk.",
@@ -48,7 +51,8 @@ def _extract_state_dict(checkpoint: dict) -> dict:
     except (KeyError, TypeError):
         pass
 
-    for key in ("state_dict", "model", "model_state_dict"):
+    # R3M / VIP save the DataParallel-wrapped model under custom top-level keys.
+    for key in ("state_dict", "model", "model_state_dict", "r3m", "vip"):
         if key in checkpoint and isinstance(checkpoint[key], dict):
             return checkpoint[key]
     return checkpoint

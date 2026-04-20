@@ -74,7 +74,7 @@ for POLICY in act dp; do
       --batch_size="$BS"
       --steps="$STEPS"
       --eval_freq=0
-      --save_freq=0
+      --save_freq=999999
       --seed="$SEED"
       --policy.optimizer_lr="$LR"
       --output_dir="$RUN_DIR"
@@ -86,7 +86,7 @@ for POLICY in act dp; do
     if [[ "$POLICY" == "act" ]]; then
       CMD+=(--policy.type=act --policy.optimizer_lr_backbone="$LR")
     else
-      CMD+=(--policy.type=diffusion)
+      CMD+=(--policy.type=diffusion --policy.use_group_norm=false)
     fi
 
     echo "[GPU $GPU_ID] $RUN_NAME — launching..."

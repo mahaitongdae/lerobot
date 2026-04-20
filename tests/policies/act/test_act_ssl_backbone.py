@@ -619,3 +619,180 @@ class TestRealBYOLWeights:
             out = encoder(torch.randn(1, 3, IMAGE_SIZE, IMAGE_SIZE))
         assert out.shape[0] == 1
         assert not torch.isnan(out).any()
+
+
+# ---------------------------------------------------------------------------
+# End-to-end with real VIP weights (Ma et al., ICLR 2023; direct S3, ~94 MB)
+# ---------------------------------------------------------------------------
+
+VIP_URL = "https://pytorch.s3.amazonaws.com/models/rl/vip/model.pt"
+
+
+@pytest.mark.slow
+class TestRealVIPWeights:
+    """Tests that download and load the official VIP ResNet-50 checkpoint.
+
+    VIP saves the DataParallel-wrapped model under a top-level "vip" key, with the
+    ResNet-50 backbone living under the "module.convnet." prefix.
+    """
+
+    @pytest.fixture(autouse=True, scope="class")
+    def vip_checkpoint(self, tmp_path_factory):
+        cache_dir = tmp_path_factory.mktemp("vip_cache")
+        ckpt_path = cache_dir / "vip_model.pt"
+        ckpt = torch.hub.load_state_dict_from_url(
+            VIP_URL, model_dir=str(cache_dir), map_location="cpu"
+        )
+        torch.save(ckpt, ckpt_path)
+        self.__class__._ckpt_path = str(ckpt_path)
+        self.__class__._raw_sd = ckpt["vip"]
+
+    @property
+    def ckpt_path(self):
+        return self.__class__._ckpt_path
+
+    @property
+    def raw_sd(self):
+        return self.__class__._raw_sd
+
+    def test_wrapper_key_extraction(self):
+        """`_extract_state_dict` should unwrap the top-level 'vip' key."""
+        extracted = _extract_state_dict({"vip": self.raw_sd, "optim": {}})
+        assert extracted is self.raw_sd
+
+    def test_prefix_detection(self):
+        target_keys = set(torchvision.models.resnet50().state_dict().keys())
+        stripped, prefix = _strip_best_prefix(self.raw_sd, target_keys)
+        assert prefix == "module.convnet."
+        assert len(set(stripped.keys()) & target_keys) >= 318
+
+    def test_load_into_resnet50(self):
+        model = torchvision.models.resnet50()
+        load_ssl_weights_into_resnet(model, self.ckpt_path)
+        assert model.conv1.weight.abs().mean() > 0
+
+    def test_loaded_weights_match_source_exactly(self):
+        model = torchvision.models.resnet50()
+        load_ssl_weights_into_resnet(model, self.ckpt_path)
+
+        source = {
+            k.replace("module.convnet.", ""): v
+            for k, v in self.raw_sd.items()
+            if k.startswith("module.convnet.")
+        }
+        for key, param in model.state_dict().items():
+            if "fc." in key or key not in source:
+                continue
+            torch.testing.assert_close(param, source[key], rtol=0, atol=0)
+
+    def test_act_forward_with_vip(self):
+        config = _make_act_config(ssl_path=self.ckpt_path, chunk_size=5, n_action_steps=5)
+        model = ACT(config)
+        model.eval()
+        batch = {
+            OBS_STATE: torch.randn(1, STATE_DIM),
+            OBS_IMAGES: [torch.randn(1, 3, IMAGE_SIZE, IMAGE_SIZE)],
+        }
+        with torch.no_grad():
+            actions, _ = model(batch)
+        assert actions.shape == (1, 5, ACTION_DIM)
+        assert not torch.isnan(actions).any()
+
+    def test_diffusion_encoder_forward_with_vip(self):
+        config = _make_diffusion_config(ssl_path=self.ckpt_path)
+        encoder = DiffusionRgbEncoder(config)
+        encoder.eval()
+        with torch.no_grad():
+            out = encoder(torch.randn(1, 3, IMAGE_SIZE, IMAGE_SIZE))
+        assert out.shape[0] == 1
+        assert not torch.isnan(out).any()
+
+
+# ---------------------------------------------------------------------------
+# End-to-end with real R3M weights (Nair et al., CoRL 2022; via `r3m` pip package)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.slow
+class TestRealR3MWeights:
+    """Tests that download and load the official R3M ResNet-50 checkpoint via gdown.
+
+    R3M saves the DataParallel-wrapped model under a top-level "r3m" key, with the
+    ResNet-50 backbone living under the "module.convnet." prefix (same layout as VIP).
+    Requires: `pip install git+https://github.com/facebookresearch/r3m`
+    """
+
+    @pytest.fixture(autouse=True, scope="class")
+    def r3m_checkpoint(self):
+        import os
+        from os.path import expanduser
+
+        r3m = pytest.importorskip(
+            "r3m", reason="r3m package not installed (pip install git+https://github.com/facebookresearch/r3m)"
+        )
+        # Triggers gdown download on first run; subsequent calls are cached.
+        r3m.load_r3m("resnet50")
+        ckpt_path = os.path.join(expanduser("~"), ".r3m", "r3m_50", "model.pt")
+        assert os.path.isfile(ckpt_path), f"R3M checkpoint not found at {ckpt_path}"
+        self.__class__._ckpt_path = ckpt_path
+        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        self.__class__._raw_sd = ckpt["r3m"]
+
+    @property
+    def ckpt_path(self):
+        return self.__class__._ckpt_path
+
+    @property
+    def raw_sd(self):
+        return self.__class__._raw_sd
+
+    def test_wrapper_key_extraction(self):
+        extracted = _extract_state_dict({"r3m": self.raw_sd, "optim": {}})
+        assert extracted is self.raw_sd
+
+    def test_prefix_detection(self):
+        target_keys = set(torchvision.models.resnet50().state_dict().keys())
+        stripped, prefix = _strip_best_prefix(self.raw_sd, target_keys)
+        assert prefix == "module.convnet."
+        assert len(set(stripped.keys()) & target_keys) >= 318
+
+    def test_load_into_resnet50(self):
+        model = torchvision.models.resnet50()
+        load_ssl_weights_into_resnet(model, self.ckpt_path)
+        assert model.conv1.weight.abs().mean() > 0
+
+    def test_loaded_weights_match_source_exactly(self):
+        model = torchvision.models.resnet50()
+        load_ssl_weights_into_resnet(model, self.ckpt_path)
+
+        source = {
+            k.replace("module.convnet.", ""): v
+            for k, v in self.raw_sd.items()
+            if k.startswith("module.convnet.")
+        }
+        for key, param in model.state_dict().items():
+            if "fc." in key or key not in source:
+                continue
+            torch.testing.assert_close(param, source[key], rtol=0, atol=0)
+
+    def test_act_forward_with_r3m(self):
+        config = _make_act_config(ssl_path=self.ckpt_path, chunk_size=5, n_action_steps=5)
+        model = ACT(config)
+        model.eval()
+        batch = {
+            OBS_STATE: torch.randn(1, STATE_DIM),
+            OBS_IMAGES: [torch.randn(1, 3, IMAGE_SIZE, IMAGE_SIZE)],
+        }
+        with torch.no_grad():
+            actions, _ = model(batch)
+        assert actions.shape == (1, 5, ACTION_DIM)
+        assert not torch.isnan(actions).any()
+
+    def test_diffusion_encoder_forward_with_r3m(self):
+        config = _make_diffusion_config(ssl_path=self.ckpt_path)
+        encoder = DiffusionRgbEncoder(config)
+        encoder.eval()
+        with torch.no_grad():
+            out = encoder(torch.randn(1, 3, IMAGE_SIZE, IMAGE_SIZE))
+        assert out.shape[0] == 1
+        assert not torch.isnan(out).any()

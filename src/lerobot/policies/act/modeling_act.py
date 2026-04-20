@@ -168,6 +168,120 @@ class MoCoV3BackboneWrapper(nn.Module):
         return {"feature_map": feature_map}
 
 
+class VoltronBackboneWrapper(nn.Module):
+    """Wraps a Voltron (Karamcheti et al. 2023) pretrained encoder for use as ACT backbone.
+
+    Requires the optional `voltron-robotics` package. The wrapper calls
+    ``voltron.load(model_id)`` to download the checkpoint on first use, then exposes
+    the visual-only representation reshaped to a (B, C, H, W) feature map.
+
+    Supported model IDs (all ViT-S/16, 224x224, embed_dim=384 unless noted):
+        - "v-cond":       V-Cond ViT-S  (language-conditioned, single-frame)
+        - "v-dual":       V-Dual ViT-S  (language-conditioned, dual-frame)
+        - "v-gen":        V-Gen  ViT-S
+        - "v-cond-base":  V-Cond ViT-B  (embed_dim=768)
+        - "r-mvp":        MVP   reproduction (ViT-S, no language)
+        - "r-r3m-vit":    R3M   reproduction with ViT-S
+    """
+
+    def __init__(
+        self,
+        model_id: str = "v-cond",
+        cache_dir: str | None = None,
+    ):
+        super().__init__()
+        try:
+            import voltron
+        except ImportError as e:
+            raise ImportError(
+                "Voltron backbone requires the `voltron-robotics` package. "
+                "Install with `pip install voltron-robotics`."
+            ) from e
+
+        kwargs = {"freeze": False}
+        if cache_dir is not None:
+            kwargs["cache"] = cache_dir
+        model, _preprocess = voltron.load(model_id, **kwargs)
+        self.model = model
+        self.model_id = model_id
+        self.hidden_size = model.embed_dim
+        # Voltron ViT-S/B use patch_size=16 on 224px => 14x14 feature grid.
+        self.patch_size = getattr(model, "patch_size", 16)
+        self.image_size = getattr(model, "resolution", 224)
+        self.grid_size = self.image_size // self.patch_size
+        # Visual-only mode: drops language tokens from the multimodal sequence.
+        self._mode = "visual"
+
+    def forward(self, x: Tensor) -> dict[str, Tensor]:
+        if x.shape[-2:] != (self.image_size, self.image_size):
+            x = F.interpolate(x, size=(self.image_size, self.image_size), mode="bilinear", align_corners=False)
+
+        # `get_representations` handles both language-conditioned (v-cond/v-dual/v-gen) and
+        # language-free (r-mvp) models; mode="visual" returns only patch tokens.
+        representations = self.model.get_representations(x, language=None, mode=self._mode)
+        # representations: (B, num_patches, embed_dim)
+        feature_map = einops.rearrange(
+            representations, "b (h w) c -> b c h w", h=self.grid_size, w=self.grid_size
+        )
+        return {"feature_map": feature_map}
+
+
+class CpMaeBackboneWrapper(nn.Module):
+    """Wraps a pretrained CP-MAE ViT encoder for use as ACT backbone.
+
+    Produces feature maps compatible with ACT's expected format:
+    {"feature_map": (B, embed_dim, H, W)} where H=W=14 for ViT-S/16 on 224x224.
+    """
+
+    def __init__(
+        self,
+        checkpoint_path: str,
+        img_size: int = 224,
+        patch_size: int = 16,
+        embed_dim: int = 384,
+        depth: int = 12,
+        n_heads: int = 6,
+    ):
+        super().__init__()
+        self.hidden_size = embed_dim
+        self.patch_size = patch_size
+        self.image_size = img_size
+        self.grid_size = img_size // patch_size
+
+        from scripts.cpmae.pretrain_mae import ViTEncoder
+
+        self.encoder = ViTEncoder(
+            img_size=img_size,
+            patch_size=patch_size,
+            in_chans=3,
+            embed_dim=embed_dim,
+            depth=depth,
+            n_heads=n_heads,
+        )
+
+        from pathlib import Path
+
+        checkpoint_path = Path(checkpoint_path)
+        if checkpoint_path.exists():
+            state_dict = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+            self.encoder.load_state_dict(state_dict, strict=True)
+        else:
+            raise FileNotFoundError(
+                f"CP-MAE checkpoint not found at {checkpoint_path}. "
+                "Run pretrain_mae.py first to generate the encoder checkpoint."
+            )
+
+    def forward(self, x: Tensor) -> dict[str, Tensor]:
+        if x.shape[-2:] != (self.image_size, self.image_size):
+            x = F.interpolate(x, size=(self.image_size, self.image_size), mode="bilinear", align_corners=False)
+        encoded, _ = self.encoder(x, mask=None)
+        patches = encoded[:, 1:]  # strip CLS token
+        feature_map = einops.rearrange(
+            patches, "b (h w) c -> b c h w", h=self.grid_size, w=self.grid_size
+        )
+        return {"feature_map": feature_map}
+
+
 class ACTPolicy(PreTrainedPolicy):
     """
     Action Chunking Transformer Policy as per Learning Fine-Grained Bimanual Manipulation with Low-Cost
@@ -466,6 +580,24 @@ class ACT(nn.Module):
                 )
                 self.backbone = mocov3_wrapper
                 backbone_out_channels = mocov3_wrapper.hidden_size
+            elif config.vision_backbone.startswith("voltron"):
+                voltron_wrapper = VoltronBackboneWrapper(
+                    model_id=config.voltron_model_id,
+                    cache_dir=config.voltron_cache_dir,
+                )
+                self.backbone = voltron_wrapper
+                backbone_out_channels = voltron_wrapper.hidden_size
+            elif config.vision_backbone.startswith("cpmae"):
+                cpmae_wrapper = CpMaeBackboneWrapper(
+                    checkpoint_path=config.cpmae_checkpoint_path,
+                    img_size=config.cpmae_img_size,
+                    patch_size=config.cpmae_patch_size,
+                    embed_dim=config.cpmae_embed_dim,
+                    depth=config.cpmae_depth,
+                    n_heads=config.cpmae_n_heads,
+                )
+                self.backbone = cpmae_wrapper
+                backbone_out_channels = cpmae_wrapper.hidden_size
             else:
                 backbone_model = getattr(torchvision.models, config.vision_backbone)(
                     replace_stride_with_dilation=[False, False, config.replace_final_stride_with_dilation],

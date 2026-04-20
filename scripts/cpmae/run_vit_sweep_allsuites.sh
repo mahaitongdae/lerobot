@@ -2,14 +2,20 @@
 # ViT backbone sweep: ACT with pretrained ViT encoders
 # on all 4 LIBERO suites (10 tasks each), frozen encoder, lr=5e-5
 #
-# Backbones:
-#   dinov2_vits  — DINOv2 ViT-S/14 (facebook/dinov2-small, 384-dim)
-#   dinov2_vitb  — DINOv2 ViT-B/14 (facebook/dinov2-base, 768-dim)
-#   siglip_vitb  — SigLIP ViT-B/16 (google/siglip-base-patch16-224, 768-dim)
-#   mocov3_vits  — MoCo v3 ViT-S/16 (300ep, Facebook, 384-dim)
+# Backbones (smallest ViT variant per method):
+#   dinov2_vits     — DINOv2 ViT-S/14 (facebook/dinov2-small, 384-dim)
+#   dinov2_vitb    — DINOv2 ViT-B/14 (facebook/dinov2-base, 768-dim)
+#   siglip_vitb     — SigLIP ViT-B/16 (google/siglip-base-patch16-224, 768-dim)
+#   mocov3_vits     — MoCo v3 ViT-S/16 (300ep, Facebook, 384-dim)
+#   mvp_vits        — MVP ViT-S/16 MAE (Xiao et al., NeurIPS 2022; ego-hoi, 384-dim)
+#   vc1_vitb        — VC-1 ViT-B/16 MAE (Majumdar et al., NeurIPS 2023; ego4d+imagenet, 768-dim)
+#   voltron_vcond   — Voltron V-Cond ViT-S/16 (Karamcheti et al. 2023; language-conditioned, 384-dim)
 #
-# Grid: 1 policy × 4 suites × 4 backbones = 16 jobs
+# Grid: 1 policy × 4 suites × 7 backbones = 28 jobs
 # Suites: libero_10, libero_spatial, libero_object, libero_goal
+#
+# Prerequisite for voltron_vcond: `pip install voltron-robotics`
+# (the script auto-downloads the Voltron checkpoint via the package on first run.)
 #
 # Prerequisites:
 #   python scripts/cpmae/build_task_mapping.py   # generates task_mapping.json (one-time)
@@ -42,10 +48,16 @@ REPO_ID="HuggingFaceVLA/libero"
 # ── ViT backbone definitions ─────────────────────────────────────
 # MoCo v3 ViT-S checkpoint URL
 MOCOV3_VITS_URL="https://dl.fbaipublicfiles.com/moco-v3/vit-s-300ep/vit-s-300ep.pth.tar"
+# MVP ViT-S MAE checkpoint (ego-hoi, 22M params, 384-dim)
+MVP_VITS_URL="https://berkeley.box.com/shared/static/m93ynem558jo8vltlads5rcmnahgsyzr.pth"
+# VC-1 ViT-B MAE checkpoint (ego4d+imagenet, 86M params, 768-dim)
+VC1_VITB_URL="https://dl.fbaipublicfiles.com/eai-vc/vc1_vitb.pth"
+# Voltron cache directory (the voltron-robotics package downloads to `cache/` by default)
+VOLTRON_CACHE_DIR="${VOLTRON_CACHE_DIR:-$HOME/.voltron}"
 
 # ── Suite & backbone lists ────────────────────────────────────────
 SUITES=(libero_10 libero_spatial libero_object libero_goal)
-BACKBONES=(dinov2_vits dinov2_vitb siglip_vitb mocov3_vits)
+BACKBONES=(dinov2_vits dinov2_vitb siglip_vitb mocov3_vits mvp_vits vc1_vitb voltron_vcond)
 
 MAPPING_JSON="scripts/cpmae/task_mapping.json"
 
@@ -73,12 +85,13 @@ for suite in "${SUITES[@]}"; do
 done
 echo ""
 
-# ── Pre-download MoCo v3 checkpoint ──────────────────────────────
+# ── Pre-download ViT checkpoints ─────────────────────────────────
 if [[ -z "${DRY_RUN:-}" ]]; then
-  echo "Pre-downloading MoCo v3 checkpoint..."
-  python3 -c "
+  echo "Pre-downloading torch.hub ViT checkpoints (MoCo v3, MVP, VC-1)..."
+  for url in "$MOCOV3_VITS_URL" "$MVP_VITS_URL" "$VC1_VITB_URL"; do
+    python3 -c "
 import torch, os
-url = '${MOCOV3_VITS_URL}'
+url = '${url}'
 cache_dir = os.path.expanduser('~/.cache/torch/hub/checkpoints')
 fname = os.path.basename(url.split('?')[0])
 fpath = os.path.join(cache_dir, fname)
@@ -89,6 +102,7 @@ else:
     torch.hub.load_state_dict_from_url(url, map_location='cpu')
     print(f'  {fname} — done')
 "
+  done
   echo ""
 
   echo "Pre-downloading HuggingFace ViT models (DINOv2, SigLIP)..."
@@ -102,6 +116,15 @@ print(f'  Loading google/siglip-base-patch16-224...')
 SiglipVisionModel.from_pretrained('google/siglip-base-patch16-224')
 print(f'  google/siglip-base-patch16-224 — cached')
 "
+  echo ""
+
+  echo "Pre-downloading Voltron V-Cond checkpoint (via voltron-robotics package)..."
+  mkdir -p "$VOLTRON_CACHE_DIR"
+  python3 - <<PYEOF || { echo "  ERROR: failed to pre-download Voltron. Install: pip install voltron-robotics" >&2; exit 1; }
+import voltron
+model, _ = voltron.load('v-cond', freeze=True, cache='${VOLTRON_CACHE_DIR}')
+print(f'  Voltron v-cond — cached at ${VOLTRON_CACHE_DIR}/v-cond/')
+PYEOF
   echo ""
 fi
 
@@ -198,6 +221,30 @@ run_task() {
                 --policy.mocov3_arch=vit_small
             )
             ;;
+        mvp_vits)
+            # MVP MAE ViT-S uses the same timm-style key layout as MoCo v3, so the existing
+            # `mocov3` loader (with its no-prefix fallback path) handles the MAE checkpoint.
+            cmd+=(
+                --policy.vision_backbone=mocov3
+                --policy.mocov3_checkpoint_path="$MVP_VITS_URL"
+                --policy.mocov3_arch=vit_small
+            )
+            ;;
+        vc1_vitb)
+            # VC-1 ViT-B is an MAE-pretrained timm ViT; loaded via the `mocov3` path.
+            cmd+=(
+                --policy.vision_backbone=mocov3
+                --policy.mocov3_checkpoint_path="$VC1_VITB_URL"
+                --policy.mocov3_arch=vit_base
+            )
+            ;;
+        voltron_vcond)
+            cmd+=(
+                --policy.vision_backbone=voltron
+                --policy.voltron_model_id=v-cond
+                --policy.voltron_cache_dir="$VOLTRON_CACHE_DIR"
+            )
+            ;;
     esac
 
     echo "[GPU ${gpu}] ${run_name} (act, ${suite}, ${backbone}, ${num_tasks} tasks)"
@@ -214,7 +261,7 @@ export -f run_task
 
 export GPUS REPO_ID RESULTS_DIR STEPS EVAL_FREQ SAVE_FREQ
 export N_EVAL_EPISODES EVAL_BATCH BATCH_SIZE LR SEED
-export MOCOV3_VITS_URL
+export MOCOV3_VITS_URL MVP_VITS_URL VC1_VITB_URL VOLTRON_CACHE_DIR
 
 # ── Launch ─────────────────────────────────────────────────────────
 TOTAL_JOBS=$(( ${#SUITES[@]} * ${#BACKBONES[@]} ))

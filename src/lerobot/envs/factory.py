@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import importlib
+from collections.abc import Callable
 from typing import Any
 
 import gymnasium as gym
@@ -214,6 +215,106 @@ def make_env(
 
     vec = env_cls([_make_one for _ in range(n_envs)], autoreset_mode=gym.vector.AutoresetMode.SAME_STEP)
 
-    # normalize to {suite: {task_id: vec_env}} for consistency
-    suite_name = cfg.type  # e.g., "pusht", "aloha"
+    suite_name = cfg.type
     return {suite_name: {0: vec}}
+
+
+def make_env_factories(
+    cfg: EnvConfig | str,
+    n_envs: int = 1,
+    use_async_envs: bool = False,
+    hub_cache_dir: str | None = None,
+    trust_remote_code: bool = False,
+) -> dict[str, dict[int, Callable[[], gym.vector.VectorEnv]]]:
+    """Like make_env but returns per-task factory callables instead of pre-built vec envs.
+
+    Return shape: {suite_name: {task_id: () -> VectorEnv}}. For LIBERO this is truly lazy; for
+    metaworld and hub-provided make_env (which build eagerly) we build once and wrap each vec env
+    in an identity callable so the downstream API is uniform.
+    """
+    if isinstance(cfg, str):
+        hub_path: str | None = cfg
+    elif isinstance(cfg, HubEnvConfig):
+        hub_path = cfg.hub_path
+    else:
+        hub_path = None
+
+    if hub_path is not None:
+        built = make_env(
+            cfg,
+            n_envs=n_envs,
+            use_async_envs=use_async_envs,
+            hub_cache_dir=hub_cache_dir,
+            trust_remote_code=trust_remote_code,
+        )
+        return {
+            suite: {tid: (lambda env=env: env) for tid, env in tids.items()}
+            for suite, tids in built.items()
+        }
+
+    if isinstance(cfg, str):
+        raise TypeError("cfg should be an EnvConfig at this point")
+
+    if n_envs < 1:
+        raise ValueError("`n_envs` must be at least 1")
+
+    env_cls = gym.vector.AsyncVectorEnv if use_async_envs else gym.vector.SyncVectorEnv
+
+    if "libero" in cfg.type:
+        from lerobot.envs.libero import create_libero_env_factories
+
+        if cfg.task is None:
+            raise ValueError("LiberoEnv requires a task to be specified")
+
+        return create_libero_env_factories(
+            task=cfg.task,
+            n_envs=n_envs,
+            camera_name=cfg.camera_name,
+            init_states=cfg.init_states,
+            gym_kwargs=cfg.gym_kwargs,
+            env_cls=env_cls,
+            control_mode=cfg.control_mode,
+            episode_length=cfg.episode_length,
+        )
+
+    if "metaworld" in cfg.type:
+        from lerobot.envs.metaworld import create_metaworld_envs
+
+        if cfg.task is None:
+            raise ValueError("MetaWorld requires a task to be specified")
+
+        built = create_metaworld_envs(
+            task=cfg.task,
+            n_envs=n_envs,
+            gym_kwargs=cfg.gym_kwargs,
+            env_cls=env_cls,
+        )
+        return {
+            suite: {tid: (lambda env=env: env) for tid, env in tids.items()}
+            for suite, tids in built.items()
+        }
+
+    if cfg.gym_id not in gym_registry:
+        print(f"gym id '{cfg.gym_id}' not found, attempting to import '{cfg.package_name}'...")
+        try:
+            importlib.import_module(cfg.package_name)
+        except ModuleNotFoundError as e:
+            raise ModuleNotFoundError(
+                f"Package '{cfg.package_name}' required for env '{cfg.type}' not found. "
+                f"Please install it or check PYTHONPATH."
+            ) from e
+
+        if cfg.gym_id not in gym_registry:
+            raise gym.error.NameNotFound(
+                f"Environment '{cfg.gym_id}' not registered even after importing '{cfg.package_name}'."
+            )
+
+    def _make_one():
+        return gym.make(cfg.gym_id, disable_env_checker=cfg.disable_env_checker, **(cfg.gym_kwargs or {}))
+
+    def _vec_factory() -> gym.vector.VectorEnv:
+        return env_cls(
+            [_make_one for _ in range(n_envs)], autoreset_mode=gym.vector.AutoresetMode.SAME_STEP
+        )
+
+    return {cfg.type: {0: _vec_factory}}

@@ -401,6 +401,47 @@ def _make_env_fns(
 # ---- Main API ----------------------------------------------------------------
 
 
+def _resolve_libero_suites_and_tasks(
+    task: str,
+    gym_kwargs: dict[str, Any] | None,
+    camera_name: str | Sequence[str],
+    env_cls: Callable[[Sequence[Callable[[], Any]]], Any] | None,
+    n_envs: int,
+) -> tuple[list[tuple[str, Any, list[int]]], list[str], dict[str, Any]]:
+    """Shared validation + suite/task resolution for the two public LIBERO entry points.
+
+    Returns:
+        (plan, camera_names, gym_kwargs_clean) where plan is a list of
+        (suite_name, suite_obj, selected_task_ids).
+    """
+    if env_cls is None or not callable(env_cls):
+        raise ValueError("env_cls must be a callable that wraps a list of environment factory callables.")
+    if not isinstance(n_envs, int) or n_envs <= 0:
+        raise ValueError(f"n_envs must be a positive int; got {n_envs}.")
+
+    gym_kwargs = dict(gym_kwargs or {})
+    task_ids_filter = gym_kwargs.pop("task_ids", None)
+
+    camera_names = _parse_camera_names(camera_name)
+    suite_names = [s.strip() for s in str(task).split(",") if s.strip()]
+    if not suite_names:
+        raise ValueError("`task` must contain at least one LIBERO suite name.")
+
+    if task_ids_filter is not None:
+        print(f"Restricting to task_ids={task_ids_filter}")
+
+    plan: list[tuple[str, Any, list[int]]] = []
+    for suite_name in suite_names:
+        suite = _get_suite(suite_name)
+        total = len(suite.tasks)
+        selected = _select_task_ids(total, task_ids_filter)
+        if not selected:
+            raise ValueError(f"No tasks selected for suite '{suite_name}' (available: {total}).")
+        plan.append((suite_name, suite, selected))
+
+    return plan, camera_names, gym_kwargs
+
+
 def create_libero_envs(
     task: str,
     n_envs: int,
@@ -421,33 +462,22 @@ def create_libero_envs(
         - `task` can be a single suite or a comma-separated list of suites.
         - You may pass `task_ids` (list[int]) inside `gym_kwargs` to restrict tasks per suite.
     """
-    if env_cls is None or not callable(env_cls):
-        raise ValueError("env_cls must be a callable that wraps a list of environment factory callables.")
-    if not isinstance(n_envs, int) or n_envs <= 0:
-        raise ValueError(f"n_envs must be a positive int; got {n_envs}.")
-
-    gym_kwargs = dict(gym_kwargs or {})
-    task_ids_filter = gym_kwargs.pop("task_ids", None)  # optional: limit to specific tasks
-
-    camera_names = _parse_camera_names(camera_name)
-    suite_names = [s.strip() for s in str(task).split(",") if s.strip()]
-    if not suite_names:
-        raise ValueError("`task` must contain at least one LIBERO suite name.")
+    plan, camera_names, gym_kwargs_clean = _resolve_libero_suites_and_tasks(
+        task=task,
+        gym_kwargs=gym_kwargs,
+        camera_name=camera_name,
+        env_cls=env_cls,
+        n_envs=n_envs,
+    )
 
     print(
-        f"Creating LIBERO envs | suites={suite_names} | n_envs(per task)={n_envs} | init_states={init_states}"
+        f"Creating LIBERO envs | suites={[s for s, _, _ in plan]} | "
+        f"n_envs(per task)={n_envs} | init_states={init_states}"
     )
-    if task_ids_filter is not None:
-        print(f"Restricting to task_ids={task_ids_filter}")
 
+    assert env_cls is not None
     out: dict[str, dict[int, Any]] = defaultdict(dict)
-    for suite_name in suite_names:
-        suite = _get_suite(suite_name)
-        total = len(suite.tasks)
-        selected = _select_task_ids(total, task_ids_filter)
-        if not selected:
-            raise ValueError(f"No tasks selected for suite '{suite_name}' (available: {total}).")
-
+    for suite_name, suite, selected in plan:
         for tid in selected:
             fns = _make_env_fns(
                 suite=suite,
@@ -457,13 +487,74 @@ def create_libero_envs(
                 n_envs=n_envs,
                 camera_names=camera_names,
                 init_states=init_states,
-                gym_kwargs=gym_kwargs,
+                gym_kwargs=gym_kwargs_clean,
                 control_mode=control_mode,
             )
             out[suite_name][tid] = env_cls(fns)
             print(f"Built vec env | suite={suite_name} | task_id={tid} | n_envs={n_envs}")
 
-    # return plain dicts for predictability
+    return {suite: dict(task_map) for suite, task_map in out.items()}
+
+
+def create_libero_env_factories(
+    task: str,
+    n_envs: int,
+    gym_kwargs: dict[str, Any] | None = None,
+    camera_name: str | Sequence[str] = "agentview_image,robot0_eye_in_hand_image",
+    init_states: bool = True,
+    env_cls: Callable[[Sequence[Callable[[], Any]]], Any] | None = None,
+    control_mode: str = "relative",
+    episode_length: int | None = None,
+) -> dict[str, dict[int, Callable[[], Any]]]:
+    """
+    Like :func:`create_libero_envs` but returns per-task factory callables instead of pre-built vec envs.
+
+    This lets callers (e.g. eval loops) construct one vec env at a time, run it, close it, and move on —
+    keeping only `max_parallel_tasks` MuJoCo simulators alive at any moment and eliminating the
+    upfront N×(suite,task) wall-clock cost.
+
+    Returns:
+        dict[suite_name][task_id] -> zero-arg callable returning a freshly built vec env.
+    """
+    plan, camera_names, gym_kwargs_clean = _resolve_libero_suites_and_tasks(
+        task=task,
+        gym_kwargs=gym_kwargs,
+        camera_name=camera_name,
+        env_cls=env_cls,
+        n_envs=n_envs,
+    )
+
+    print(
+        f"Preparing LIBERO env factories | suites={[s for s, _, _ in plan]} | "
+        f"n_envs(per task)={n_envs} | init_states={init_states}"
+    )
+
+    assert env_cls is not None
+
+    def _make_factory(suite, suite_name: str, tid: int) -> Callable[[], Any]:
+        def _factory() -> Any:
+            fns = _make_env_fns(
+                suite=suite,
+                episode_length=episode_length,
+                suite_name=suite_name,
+                task_id=tid,
+                n_envs=n_envs,
+                camera_names=camera_names,
+                init_states=init_states,
+                gym_kwargs=gym_kwargs_clean,
+                control_mode=control_mode,
+            )
+            vec = env_cls(fns)
+            print(f"Built vec env (lazy) | suite={suite_name} | task_id={tid} | n_envs={n_envs}")
+            return vec
+
+        return _factory
+
+    out: dict[str, dict[int, Callable[[], Any]]] = defaultdict(dict)
+    for suite_name, suite, selected in plan:
+        for tid in selected:
+            out[suite_name][tid] = _make_factory(suite, suite_name, tid)
+
     return {suite: dict(task_map) for suite, task_map in out.items()}
 
 

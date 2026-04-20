@@ -185,3 +185,7 @@ IDEA_REPORT.md
 refine-logs/*
 literature**.md
 vast-instances.json
+
+research-wiki/*
+.claude/*
+MUJOCO_LOG.TXT

@@ -71,11 +71,11 @@ from tqdm import trange
 
 from lerobot.configs import parser
 from lerobot.configs.eval import EvalPipelineConfig
-from lerobot.envs.factory import make_env, make_env_pre_post_processors
+from lerobot.envs.factory import make_env_factories, make_env_pre_post_processors
 from lerobot.envs.utils import (
+    _close_single_env,
     add_envs_task,
     check_env_attributes_and_types,
-    close_envs,
     preprocess_observation,
 )
 from lerobot.policies.factory import make_policy, make_pre_post_processors
@@ -524,8 +524,8 @@ def eval_main(cfg: EvalPipelineConfig):
 
     logging.info(colored("Output dir:", "yellow", attrs=["bold"]) + f" {cfg.output_dir}")
 
-    logging.info("Making environment.")
-    envs = make_env(
+    logging.info("Preparing environment factories.")
+    env_factories = make_env_factories(
         cfg.env,
         n_envs=cfg.eval.batch_size,
         use_async_envs=cfg.eval.use_async_envs,
@@ -557,11 +557,10 @@ def eval_main(cfg: EvalPipelineConfig):
     # Create environment-specific preprocessor and postprocessor (e.g., for LIBERO environments)
     env_preprocessor, env_postprocessor = make_env_pre_post_processors(env_cfg=cfg.env, policy_cfg=cfg.policy)
 
-    # Build dataset_task_index_map for multi-task eval
     dataset_task_index_map = None
     if (
         cfg.dataset_repo_id
-        and isinstance(envs, dict)
+        and isinstance(env_factories, dict)
         and getattr(policy.config, "num_tasks", None) is not None
     ):
         try:
@@ -569,7 +568,7 @@ def eval_main(cfg: EvalPipelineConfig):
             from lerobot.envs.libero import build_dataset_task_index_map
 
             meta = LeRobotDatasetMetadata(cfg.dataset_repo_id)
-            dataset_task_index_map = build_dataset_task_index_map(envs, meta.tasks)
+            dataset_task_index_map = build_dataset_task_index_map(env_factories, meta.tasks)
             logging.info("Built dataset_task_index_map for eval: %s", dataset_task_index_map)
         except Exception:
             logging.warning(
@@ -579,7 +578,7 @@ def eval_main(cfg: EvalPipelineConfig):
 
     with torch.no_grad(), torch.autocast(device_type=device.type) if cfg.policy.use_amp else nullcontext():
         info = eval_policy_all(
-            envs=envs,
+            env_factories=env_factories,
             policy=policy,
             env_preprocessor=env_preprocessor,
             env_postprocessor=env_postprocessor,
@@ -599,8 +598,6 @@ def eval_main(cfg: EvalPipelineConfig):
         for task_group, task_group_info in info.items():
             print(f"\nAggregated Metrics for {task_group}:")
             print(task_group_info)
-    # Close all vec envs
-    close_envs(envs)
 
     # Save info
     with open(Path(cfg.output_dir) / "eval_info.json", "w") as f:
@@ -666,7 +663,7 @@ def eval_one(
 def run_one(
     task_group: str,
     task_id: int,
-    env,
+    env_or_factory,
     *,
     policy,
     env_preprocessor,
@@ -680,39 +677,45 @@ def run_one(
     start_seed: int | None,
     dataset_task_index: int | None = None,
 ):
-    """
-    Run eval_one for a single (task_group, task_id, env).
-    Returns (task_group, task_id, task_metrics_dict).
-    This function is intentionally module-level to make it easy to test.
+    """Run eval_one for a single (task_group, task_id).
+
+    ``env_or_factory`` may be either a pre-built gym vector env (legacy) or a zero-arg callable that
+    returns one. When it is a factory, the vec env is constructed here and closed immediately after
+    eval so at most ``max_parallel_tasks`` simulators are alive at a time.
     """
     task_videos_dir = None
     if videos_dir is not None:
         task_videos_dir = videos_dir / f"{task_group}_{task_id}"
         task_videos_dir.mkdir(parents=True, exist_ok=True)
 
-    # Call the existing eval_one (assumed to return TaskMetrics-like dict)
-    metrics = eval_one(
-        env,
-        policy=policy,
-        env_preprocessor=env_preprocessor,
-        env_postprocessor=env_postprocessor,
-        preprocessor=preprocessor,
-        postprocessor=postprocessor,
-        n_episodes=n_episodes,
-        max_episodes_rendered=max_episodes_rendered,
-        videos_dir=task_videos_dir,
-        return_episode_data=return_episode_data,
-        start_seed=start_seed,
-        dataset_task_index=dataset_task_index,
-    )
-    # ensure we always provide video_paths key to simplify accumulation
+    is_factory = callable(env_or_factory) and not isinstance(env_or_factory, gym.Env)
+    env = env_or_factory() if is_factory else env_or_factory
+    try:
+        metrics = eval_one(
+            env,
+            policy=policy,
+            env_preprocessor=env_preprocessor,
+            env_postprocessor=env_postprocessor,
+            preprocessor=preprocessor,
+            postprocessor=postprocessor,
+            n_episodes=n_episodes,
+            max_episodes_rendered=max_episodes_rendered,
+            videos_dir=task_videos_dir,
+            return_episode_data=return_episode_data,
+            start_seed=start_seed,
+            dataset_task_index=dataset_task_index,
+        )
+    finally:
+        if is_factory:
+            _close_single_env(env)
+
     if max_episodes_rendered > 0:
         metrics.setdefault("video_paths", [])
     return task_group, task_id, metrics
 
 
 def eval_policy_all(
-    envs: dict[str, dict[int, gym.vector.VectorEnv]],
+    env_factories: dict[str, dict[int, Callable[[], gym.vector.VectorEnv]]],
     policy,
     env_preprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
     env_postprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
@@ -727,17 +730,16 @@ def eval_policy_all(
     max_parallel_tasks: int = 1,
     dataset_task_index_map: dict[tuple[str, int], int] | None = None,
 ) -> dict:
-    """
-    Evaluate a nested `envs` dict: {task_group: {task_id: vec_env}}.
-    This implementation flattens tasks, runs them sequentially or via ThreadPoolExecutor,
-    accumulates per-group and overall statistics, and returns the same aggregate metrics
-    schema as the single-env evaluator (avg_sum_reward / avg_max_reward / pc_success / timings)
-    plus per-task infos.
+    """Evaluate a nested dict of env factories.
+
+    Shape: ``{task_group: {task_id: () -> vec_env}}``. Each task's vec env is constructed lazily
+    inside ``run_one`` right before its rollout and closed immediately after, bounding live
+    simulators to ``max_parallel_tasks``. Accepts either factory callables or pre-built vec envs
+    per entry (``run_one`` auto-detects).
     """
     start_t = time.time()
 
-    # Flatten envs into list of (task_group, task_id, env)
-    tasks = [(tg, tid, vec) for tg, group in envs.items() for tid, vec in group.items()]
+    tasks = [(tg, tid, fac) for tg, group in env_factories.items() for tid, fac in group.items()]
 
     # accumulators: track metrics at both per-group level and across all groups
     group_acc: dict[str, dict[str, list]] = defaultdict(lambda: {k: [] for k in ACC_KEYS})
@@ -786,9 +788,9 @@ def eval_policy_all(
     if max_parallel_tasks <= 1:
         # sequential path (single accumulator path on the main thread)
         # NOTE: keeping a single-threaded accumulator avoids concurrent list appends or locks
-        for task_group, task_id, env in tasks:
+        for task_group, task_id, env_or_factory in tasks:
             ds_idx = dataset_task_index_map.get((task_group, task_id)) if dataset_task_index_map else None
-            tg, tid, metrics = task_runner(task_group, task_id, env, dataset_task_index=ds_idx)
+            tg, tid, metrics = task_runner(task_group, task_id, env_or_factory, dataset_task_index=ds_idx)
             _accumulate_to(tg, metrics)
             per_task_infos.append({"task_group": tg, "task_id": tid, "metrics": metrics})
     else:
