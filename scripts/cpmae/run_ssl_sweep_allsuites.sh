@@ -61,7 +61,7 @@ SSL_URLS[vip]="https://pytorch.s3.amazonaws.com/models/rl/vip/model.pt"
 # ── Suite & policy lists ──────────────────────────────────────────
 SUITES=(libero_10 libero_spatial libero_object libero_goal)
 POLICIES=(act dp)
-BACKBONES=(r3m vip imagenet moco_v2 moco_v1 simclr byol)
+BACKBONES=(r3m vip imagenet moco_v2 simclr byol)
 
 MAPPING_JSON="scripts/cpmae/task_mapping.json"
 

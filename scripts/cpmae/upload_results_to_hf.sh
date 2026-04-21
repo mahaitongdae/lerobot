@@ -5,8 +5,8 @@
 #   bash /app/lerobot/scripts/cpmae/upload_results_to_hf.sh <RESULTS_DIR> <HF_REPO_ID> [--include-training-state] [--dry-run]
 #
 # Example:
-#   bash /app/lerobot/scripts/cpmae/upload_results_to_hf.sh \
-#       /app/results/multitask_allsuites haitong-ma/cpmae-multitask-results
+#   bash ./scripts/cpmae/upload_results_to_hf.sh \
+#       ./results/multitask_allsuites haitong-ma/cpmae-multitask-results
 #
 # Flags:
 #   --include-training-state  Also upload optimizer state dirs.
@@ -46,16 +46,16 @@ if [ ! -d "$RESULTS_DIR" ]; then
     exit 1
 fi
 
-# Check huggingface-cli is available
-if ! command -v huggingface-cli &>/dev/null; then
-    echo "ERROR: huggingface-cli not found. Run: pip install huggingface_hub"
+# Check hf CLI is available
+if ! command -v hf &>/dev/null; then
+    echo "ERROR: hf not found. Run: pip install -U huggingface_hub"
     exit 1
 fi
 
 # Check login
-if ! huggingface-cli whoami &>/dev/null; then
+if ! hf auth whoami &>/dev/null; then
     echo "Not logged in to Hugging Face. Run:"
-    echo "  huggingface-cli login --token <YOUR_TOKEN>"
+    echo "  hf auth login --token <YOUR_TOKEN>"
     exit 1
 fi
 
@@ -226,7 +226,7 @@ read -rp "Proceed with upload? [y/N] " confirm
 echo ""
 echo "=== Uploading to $REPO_ID ==="
 # shellcheck disable=SC2086
-huggingface-cli upload-large-folder "$REPO_ID" "$RESULTS_DIR" \
+hf upload-large-folder "$REPO_ID" "$RESULTS_DIR" \
     --repo-type model \
     $EXCLUDE_ARGS
 
