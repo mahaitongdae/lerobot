@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Training script that loads a CP-MAE encoder into ACT before running lerobot-train.
+"""Legacy helper that forwards CP-MAE convenience flags into ``lerobot-train``.
 
-This applies the monkey-patch from cpmae_backbone.py, then delegates to lerobot's
-standard training pipeline.
+ACT now supports ``vision_backbone=cpmae`` natively, so this script keeps older
+launch commands working by translating ``--cpmae_*`` flags into standard policy
+config overrides before delegating to the normal training pipeline.
 
 Usage:
     python scripts/cpmae/train_with_cpmae.py \
@@ -16,7 +17,6 @@ Usage:
 """
 
 import sys
-from pathlib import Path
 
 # Parse our custom args before --
 custom_args = []
@@ -42,21 +42,18 @@ custom_parsed = parser.parse_args(custom_args)
 
 freeze = custom_parsed.cpmae_freeze.lower() in ("true", "1", "yes")
 
-# Add project root to path
-project_root = str(Path(__file__).resolve().parents[2])
-if project_root not in sys.path:
-    sys.path.insert(0, project_root)
-
-# Apply the CP-MAE monkey-patch before lerobot imports ACT
-from scripts.cpmae.cpmae_backbone import patch_act_for_cpmae
-
-patch_act_for_cpmae(
-    checkpoint_path=custom_parsed.cpmae_checkpoint,
-    freeze=freeze,
-)
+# Keep legacy callers working while routing through the native ACT cpmae path.
+translated_args = [
+    f"--policy.cpmae_checkpoint_path={custom_parsed.cpmae_checkpoint}",
+    f"--policy.freeze_backbone={'true' if freeze else 'false'}",
+]
+if not any(arg.startswith("--policy.backbone_input_norm=") for arg in lerobot_args):
+    translated_args.append("--policy.backbone_input_norm=identity")
+if not any(arg == "--policy.vision_backbone=cpmae" or arg.startswith("--policy.vision_backbone=") for arg in lerobot_args):
+    translated_args.append("--policy.vision_backbone=cpmae")
 
 # Now set up sys.argv for lerobot's parser and run training
-sys.argv = ["lerobot-train"] + lerobot_args
+sys.argv = ["lerobot-train"] + translated_args + lerobot_args
 
 import draccus
 from lerobot.configs.train import TrainPipelineConfig

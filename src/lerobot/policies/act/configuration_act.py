@@ -13,11 +13,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import logging
 from dataclasses import dataclass, field
 
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.types import NormalizationMode
 from lerobot.optim.optimizers import AdamWConfig
+from lerobot.utils.backbone_input_norm import VALID_PRESETS as _BACKBONE_NORM_PRESETS
+from lerobot.utils.backbone_input_norm import resolve_preset as _resolve_backbone_norm_preset
+
+_logger = logging.getLogger(__name__)
 
 
 @PreTrainedConfig.register_subclass("act")
@@ -137,6 +142,16 @@ class ACTConfig(PreTrainedConfig):
     cpmae_embed_dim: int = 384
     cpmae_depth: int = 12
     cpmae_n_heads: int = 6
+    # Per-backbone pretraining input normalization applied inside the model, AFTER any
+    # dataset-statistic normalization. Use this to match the pixel statistics the backbone
+    # was pretrained with (e.g. "imagenet" for ResNet/DINOv2/MoCov3/MVP/VC-1/Voltron,
+    # "siglip" for SigLIP, "identity" for backbones pretrained on raw [0,1] such as CP-MAE).
+    # When set to anything other than "identity", `normalization_mapping["VISUAL"]` is
+    # automatically forced to IDENTITY to prevent double normalization.
+    # Choices: "identity" | "imagenet" | "siglip" | "custom".
+    backbone_input_norm: str = "identity"
+    backbone_input_mean: tuple[float, float, float] | None = None
+    backbone_input_std: tuple[float, float, float] | None = None
     freeze_backbone: bool = False
     # Transformer layers.
     pre_norm: bool = False
@@ -215,6 +230,30 @@ class ACTConfig(PreTrainedConfig):
                 "`cpmae_checkpoint_path` must be set when using a CP-MAE vision backbone "
                 "(e.g. 'results/M3_cpmae/R200_cpmae/encoder_final.pt')."
             )
+
+        # Validate the backbone input-normalization preset and auto-disable the pipeline
+        # VISUAL normalization when a pretraining preset is selected, to avoid applying
+        # dataset stats on top of the backbone's expected pretraining stats.
+        if self.backbone_input_norm not in _BACKBONE_NORM_PRESETS:
+            raise ValueError(
+                f"`backbone_input_norm` must be one of {_BACKBONE_NORM_PRESETS}. "
+                f"Got {self.backbone_input_norm!r}."
+            )
+        # Eagerly validate custom mean/std so we fail fast on misconfiguration.
+        _resolve_backbone_norm_preset(
+            self.backbone_input_norm, self.backbone_input_mean, self.backbone_input_std
+        )
+        if self.backbone_input_norm != "identity":
+            current = self.normalization_mapping.get("VISUAL", NormalizationMode.IDENTITY)
+            if current != NormalizationMode.IDENTITY:
+                _logger.warning(
+                    "backbone_input_norm=%r is set; forcing normalization_mapping['VISUAL'] "
+                    "from %s to IDENTITY to avoid double-normalizing images.",
+                    self.backbone_input_norm,
+                    current,
+                )
+                self.normalization_mapping["VISUAL"] = NormalizationMode.IDENTITY
+
         if self.temporal_ensemble_coeff is not None and self.n_action_steps > 1:
             raise NotImplementedError(
                 "`n_action_steps` must be 1 when using temporal ensembling. This is "

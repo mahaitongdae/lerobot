@@ -35,6 +35,7 @@ from torch import Tensor, nn
 
 from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
 from lerobot.policies.pretrained import PreTrainedPolicy
+from lerobot.utils.backbone_input_norm import BackboneInputNormalizer
 from lerobot.utils.ssl_backbone import load_ssl_weights_into_resnet
 from lerobot.policies.utils import (
     get_device_from_parameters,
@@ -507,6 +508,13 @@ class DiffusionRgbEncoder(nn.Module):
                 predicate=lambda x: isinstance(x, nn.BatchNorm2d),
                 func=lambda x: nn.GroupNorm(num_groups=x.num_features // 16, num_channels=x.num_features),
             )
+
+        self.backbone = BackboneInputNormalizer(
+            self.backbone,
+            preset=config.backbone_input_norm,
+            mean=config.backbone_input_mean,
+            std=config.backbone_input_std,
+        )
 
         if config.freeze_backbone:
             self.backbone.requires_grad_(False)

@@ -14,12 +14,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import logging
 from dataclasses import dataclass, field
 
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.types import NormalizationMode
 from lerobot.optim.optimizers import AdamConfig
 from lerobot.optim.schedulers import DiffuserSchedulerConfig
+from lerobot.utils.backbone_input_norm import VALID_PRESETS as _BACKBONE_NORM_PRESETS
+from lerobot.utils.backbone_input_norm import resolve_preset as _resolve_backbone_norm_preset
+
+_logger = logging.getLogger(__name__)
 
 
 @PreTrainedConfig.register_subclass("diffusion")
@@ -123,6 +128,15 @@ class DiffusionConfig(PreTrainedConfig):
     # Requires use_group_norm=False to preserve BatchNorm weights from SSL pretraining.
     ssl_checkpoint_path: str | None = None
     use_group_norm: bool = True
+    # Per-backbone pretraining input normalization applied inside the model, AFTER any
+    # dataset-statistic normalization. Use this to match the pixel statistics the backbone
+    # was pretrained with (e.g. "imagenet" for supervised/MoCo/SimCLR/BYOL/VIP ResNets).
+    # When set to anything other than "identity", `normalization_mapping["VISUAL"]` is
+    # automatically forced to IDENTITY to prevent double normalization.
+    # Choices: "identity" | "imagenet" | "siglip" | "custom".
+    backbone_input_norm: str = "identity"
+    backbone_input_mean: tuple[float, float, float] | None = None
+    backbone_input_std: tuple[float, float, float] | None = None
     freeze_backbone: bool = False
     spatial_softmax_num_keypoints: int = 32
     use_separate_rgb_encoder_per_camera: bool = False
@@ -175,6 +189,28 @@ class DiffusionConfig(PreTrainedConfig):
                 self.pretrained_backbone_weights = None
             if self.use_group_norm:
                 self.use_group_norm = False
+
+        # Validate the backbone input-normalization preset and auto-disable the pipeline
+        # VISUAL normalization when a pretraining preset is selected, to avoid applying
+        # dataset stats on top of the backbone's expected pretraining stats.
+        if self.backbone_input_norm not in _BACKBONE_NORM_PRESETS:
+            raise ValueError(
+                f"`backbone_input_norm` must be one of {_BACKBONE_NORM_PRESETS}. "
+                f"Got {self.backbone_input_norm!r}."
+            )
+        _resolve_backbone_norm_preset(
+            self.backbone_input_norm, self.backbone_input_mean, self.backbone_input_std
+        )
+        if self.backbone_input_norm != "identity":
+            current = self.normalization_mapping.get("VISUAL", NormalizationMode.IDENTITY)
+            if current != NormalizationMode.IDENTITY:
+                _logger.warning(
+                    "backbone_input_norm=%r is set; forcing normalization_mapping['VISUAL'] "
+                    "from %s to IDENTITY to avoid double-normalizing images.",
+                    self.backbone_input_norm,
+                    current,
+                )
+                self.normalization_mapping["VISUAL"] = NormalizationMode.IDENTITY
 
         supported_prediction_types = ["epsilon", "sample"]
         if self.prediction_type not in supported_prediction_types:

@@ -194,6 +194,15 @@ run_task() {
         --policy.push_to_hub=false
     )
 
+    # Per-backbone pretraining input normalization. SigLIP uses its own (0.5, 0.5, 0.5)
+    # stats; every other ViT here expects ImageNet (0.485/0.456/0.406, 0.229/0.224/0.225).
+    local norm_preset="imagenet"
+    case "$backbone" in
+        siglip_*) norm_preset="siglip" ;;
+        cpmae_*)  norm_preset="identity" ;;
+    esac
+    cmd+=(--policy.backbone_input_norm="$norm_preset")
+
     # Add backbone-specific flags
     case "$backbone" in
         dinov2_vits)

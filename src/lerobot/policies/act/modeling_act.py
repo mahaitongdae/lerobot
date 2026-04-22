@@ -41,6 +41,7 @@ except ImportError:
 
 from lerobot.policies.act.configuration_act import ACTConfig
 from lerobot.policies.pretrained import PreTrainedPolicy
+from lerobot.utils.backbone_input_norm import BackboneInputNormalizer
 from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
 from lerobot.utils.ssl_backbone import load_mocov3_weights_into_vit, load_ssl_weights_into_resnet
 
@@ -247,6 +248,24 @@ class CpMaeBackboneWrapper(nn.Module):
         self.patch_size = patch_size
         self.image_size = img_size
         self.grid_size = img_size // patch_size
+
+        # scripts/ lives at the repo root (sibling of src/). When lerobot is
+        # installed (e.g. inside Docker at /app/src/lerobot), the repo root is
+        # not on sys.path by default, so we add it before importing.
+        import sys
+        from pathlib import Path as _Path
+
+        _this_file = _Path(__file__).resolve()
+        # .../src/lerobot/policies/act/modeling_act.py -> repo root is 4 levels up from src/lerobot
+        for _candidate in (
+            _this_file.parents[4],  # repo root when layout is <repo>/src/lerobot/...
+            _this_file.parents[3],  # fallback if layout differs
+        ):
+            if (_candidate / "scripts" / "cpmae" / "pretrain_mae.py").exists():
+                _repo_root = str(_candidate)
+                if _repo_root not in sys.path:
+                    sys.path.insert(0, _repo_root)
+                break
 
         from scripts.cpmae.pretrain_mae import ViTEncoder
 
@@ -610,6 +629,13 @@ class ACT(nn.Module):
                     backbone_model, return_layers={"layer4": "feature_map"}
                 )
                 backbone_out_channels = backbone_model.fc.in_features
+
+            self.backbone = BackboneInputNormalizer(
+                self.backbone,
+                preset=config.backbone_input_norm,
+                mean=config.backbone_input_mean,
+                std=config.backbone_input_std,
+            )
 
             if config.freeze_backbone:
                 self.backbone.requires_grad_(False)

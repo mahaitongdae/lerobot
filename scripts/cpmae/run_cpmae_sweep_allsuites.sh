@@ -33,10 +33,10 @@ PARALLEL=$((NUM_EACH_GPU * ${#GPUS[@]}))
 
 # ── Hyperparameters (aligned with run_vit_sweep_allsuites.sh) ─────
 STEPS=100000
-EVAL_FREQ=0
+EVAL_FREQ=25000
 SAVE_FREQ=25000
 N_EVAL_EPISODES=20
-EVAL_BATCH=10
+EVAL_BATCH=20
 BATCH_SIZE=64
 LR=5e-5
 SEED=42
@@ -195,14 +195,14 @@ echo ""
 
 if [[ -n "${DRY_RUN:-}" ]]; then
     env_parallel -P "${PARALLEL}" \
-        run_task {1} {2} {#} \
+        run_task {1} {2} {%} \
         ::: "${SUITES[@]}" \
         ::: "${VARIANTS[@]}"
 else
     env_parallel --bar \
         --results "${RESULTS_DIR}/logs" \
         -P "${PARALLEL}" \
-        run_task {1} {2} {#} \
+        run_task {1} {2} {%} \
         ::: "${SUITES[@]}" \
         ::: "${VARIANTS[@]}"
 fi
