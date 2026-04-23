@@ -22,7 +22,8 @@
 set -euo pipefail
 
 GPUS=("${@:-0}")
-NUM_GPUS=${#GPUS[@]}
+NUM_EACH_GPU=1
+PARALLEL=$((NUM_EACH_GPU * ${#GPUS[@]}))
 
 # HP from M2 SSL sweep (same for ACT and DP — controlled comparison)
 BATCH_SIZE=64
@@ -47,13 +48,6 @@ SSL_URL="https://dl.fbaipublicfiles.com/moco/moco_checkpoints/moco_v2_800ep/moco
 
 mkdir -p "$RESULTS_DIR"
 mkdir -p "${RESULTS_DIR}/logs"
-
-# Trap Ctrl+C
-cleanup() {
-  echo ""; echo "Caught interrupt — killing background jobs..."
-  kill $(jobs -p) 2>/dev/null; wait 2>/dev/null; exit 1
-}
-trap cleanup SIGINT SIGTERM
 
 # Ensure task_mapping.json exists
 if [[ ! -f "$MAPPING_JSON" ]]; then
@@ -250,35 +244,33 @@ run_task() {
       -- "${train_args[@]}" 2>&1 | tee "${RESULTS_DIR}/logs/${run_name}.log"
   fi
 }
+export -f run_task
 
-# ── Dispatch ─────────────────────────────────────────────────────────
+export GPUS REPO_ID RESULTS_DIR STEPS EVAL_FREQ SAVE_FREQ
+export N_EVAL_EPISODES EVAL_BATCH BATCH_SIZE LR NUM_WORKERS SEED
+export SSL_URL SUITE CONTACT_LABELS_DIR
+export ALL_EPISODES NUM_TASKS TASK_INDEX_OFFSET ENV_TASK_IDS
+
+# ── Launch ─────────────────────────────────────────────────────────
 TOTAL=${#EXPERIMENTS[@]}
-echo "Total: $TOTAL jobs on $NUM_GPUS GPUs"
+echo "Total: $TOTAL jobs on ${#GPUS[@]} GPUs"
+echo "Parallel workers: ${PARALLEL}"
 echo ""
 
-FAILED_JOBS=0
-job_seq=0
-i=0
-while [ $i -lt $TOTAL ]; do
-  pids=()
-  job_ids=()
-  for g in $(seq 0 $((NUM_GPUS - 1))); do
-    idx=$((i + g))
-    [ $idx -ge $TOTAL ] && break
-    read -r run_id policy degrade <<< "${EXPERIMENTS[$idx]}"
-    job_seq=$((job_seq + 1))
-    run_task "$run_id" "$policy" "$degrade" "$job_seq" &
-    pids+=($!)
-    job_ids+=("${run_id}_${policy}_${degrade}")
-  done
-  for j in "${!pids[@]}"; do
-    if ! wait "${pids[$j]}"; then
-      echo "FAILED: ${job_ids[$j]}"
-      FAILED_JOBS=$((FAILED_JOBS + 1))
-    fi
-  done
-  i=$((i + NUM_GPUS))
-done
+. env_parallel.bash
+
+if [[ -n "${DRY_RUN:-}" ]]; then
+    printf '%s\n' "${EXPERIMENTS[@]}" | \
+        env_parallel --colsep ' ' \
+            -P "${PARALLEL}" \
+            run_task {1} {2} {3} {%}
+else
+    printf '%s\n' "${EXPERIMENTS[@]}" | \
+        env_parallel --bar --colsep ' ' \
+            --results "${RESULTS_DIR}/logs" \
+            -P "${PARALLEL}" \
+            run_task {1} {2} {3} {%}
+fi
 
 echo ""
 echo "========================================="
@@ -286,11 +278,6 @@ echo "M1 Diagnostic (C1+C2) Complete"
 echo "========================================="
 echo "Results in: $RESULTS_DIR/"
 echo "Backbone: $SSL_BACKBONE (both ACT and DP)"
-if [ $FAILED_JOBS -gt 0 ]; then
-  echo "WARNING: $FAILED_JOBS job(s) failed — check logs"
-fi
 echo ""
 echo "Next: run post-training eval:"
 echo "  bash scripts/cpmae/M1/run_eval_diagnostic_c1c2.sh 0 1 2 3"
-
-exit $( [ $FAILED_JOBS -gt 0 ] && echo 1 || echo 0 )
