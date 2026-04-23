@@ -377,22 +377,27 @@ class LiberoImageDataset(Dataset):
                     data = json.load(f)
                 for ep_str, ep_data in data["episodes"].items():
                     self.contact_labels[int(ep_str)] = ep_data["labels"]
-            # Validate coverage: warn if dataset episodes are missing labels
-            dataset_episodes = set()
-            for i in range(len(self.dataset)):
-                ep = self.dataset[i].get("episode_index", None)
-                if ep is not None:
-                    dataset_episodes.add(ep.item() if torch.is_tensor(ep) else ep)
-                if len(dataset_episodes) > 500:
-                    break  # sample check, not exhaustive
+            # Validate coverage via metadata only.
+            # IMPORTANT: do NOT iterate self.dataset[i] here — every index decodes
+            # a video frame through torchcodec, which easily burns 10+ minutes
+            # per run and has been observed to hang the sweep before any GPU
+            # work starts (see refine-logs/BACKBONE_INPUT_NORM_FIX.md).
+            try:
+                dataset_episodes = {
+                    int(ep.item()) if torch.is_tensor(ep) else int(ep)
+                    for ep in self.dataset.hf_dataset.unique("episode_index")
+                }
+            except Exception:
+                dataset_episodes = set(range(self.dataset.meta.total_episodes))
             labeled_episodes = set(self.contact_labels.keys())
             missing = dataset_episodes - labeled_episodes
             if missing:
                 n_missing = len(missing)
                 print(
-                    f"WARNING: {n_missing} sampled episode(s) have no contact labels "
+                    f"WARNING: {n_missing} episode(s) have no contact labels "
                     f"(e.g. {sorted(missing)[:5]}). These will default to transit. "
-                    f"Labeled: {len(labeled_episodes)}, sampled: {len(dataset_episodes)}."
+                    f"Labeled: {len(labeled_episodes)}, total: {len(dataset_episodes)}.",
+                    flush=True,
                 )
 
     def __len__(self):
@@ -532,9 +537,9 @@ def train_mae(args):
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"Mode: {args.mode}")
-    print(f"Output: {output_dir}")
-    print(f"Device: {device}")
+    print(f"Mode: {args.mode}", flush=True)
+    print(f"Output: {output_dir}", flush=True)
+    print(f"Device: {device}", flush=True)
 
     # Dataset
     contact_labels_dir = args.contact_labels_dir if args.mode in ("cpmae", "hybrid") else None
@@ -553,8 +558,8 @@ def train_mae(args):
         drop_last=True,
     )
 
-    print(f"Dataset size: {len(dataset)} frames")
-    print(f"Batches per epoch: {len(dataloader)}")
+    print(f"Dataset size: {len(dataset)} frames", flush=True)
+    print(f"Batches per epoch: {len(dataloader)}", flush=True)
 
     # Model
     n_patches = (args.img_size // args.patch_size) ** 2
@@ -571,7 +576,7 @@ def train_mae(args):
 
     n_params = sum(p.numel() for p in model.parameters())
     n_encoder_params = sum(p.numel() for p in model.encoder.parameters())
-    print(f"Total params: {n_params / 1e6:.1f}M (encoder: {n_encoder_params / 1e6:.1f}M)")
+    print(f"Total params: {n_params / 1e6:.1f}M (encoder: {n_encoder_params / 1e6:.1f}M)", flush=True)
 
     # Optimizer
     optimizer = torch.optim.AdamW(

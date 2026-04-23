@@ -96,6 +96,23 @@ else:
   echo ""
 fi
 
+# ── EGL device mapping ─────────────────────────────────────────────
+# EGL device ordering does NOT match CUDA device ordering, and setting
+# CUDA_VISIBLE_DEVICES corrupts EGL enumeration. We probe once (cached
+# under .egl_probe/) and use RENDER_GPU_DEVICE_ID + --policy.device instead.
+EGL_PROBE_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/egl_probe.py"
+if [[ -z "${DRY_RUN:-}" ]]; then
+    echo "Loading EGL device mapping..."
+    EGL_MAP_JSON=$(python3 "$EGL_PROBE_SCRIPT" | grep -E '^\{.*\}$' | tail -1)
+    echo "EGL mapping (CUDA GPU -> EGL device): ${EGL_MAP_JSON}"
+    for gpu in "${GPUS[@]}"; do
+        egl_id=$(python3 -c "import json,sys; m=json.loads(sys.argv[1]); print(m.get(sys.argv[2], sys.argv[2]))" "$EGL_MAP_JSON" "$gpu")
+        export "EGL_MAP_${gpu}=${egl_id}"
+        echo "  CUDA GPU ${gpu} -> EGL device ${egl_id}"
+    done
+    echo ""
+fi
+
 # ── Experiments ──────────────────────────────────────────────────────
 # Format: RUN_ID POLICY DEGRADE_NAME
 EXPERIMENTS=(
@@ -131,11 +148,15 @@ echo ""
 run_task() {
   local run_id="$1" policy="$2" degrade="$3" job_seq="$4"
 
-  # GPU assignment
+  # GPU assignment — do NOT set CUDA_VISIBLE_DEVICES (it corrupts EGL).
+  # Use RENDER_GPU_DEVICE_ID for EGL and --policy.device for PyTorch.
   local num_gpus=${#GPUS[@]}
   local device_idx=$(( (job_seq - 1) % num_gpus ))
   local gpu=${GPUS[$device_idx]}
-  export CUDA_VISIBLE_DEVICES="$gpu"
+  unset CUDA_VISIBLE_DEVICES
+  local egl_var="EGL_MAP_${gpu}"
+  local egl_id="${!egl_var:-$gpu}"
+  export RENDER_GPU_DEVICE_ID="$egl_id"
 
   local run_name="${run_id}_${policy}_${degrade}"
   local run_dir="${RESULTS_DIR}/${run_name}"
@@ -147,10 +168,10 @@ run_task() {
     local saved_step
     saved_step=$(python3 -c "import json; print(json.load(open('$step_file'))['step'])")
     if [[ "$saved_step" -ge "$STEPS" ]]; then
-      echo "[GPU ${gpu}] ${run_name} — completed (step ${saved_step}), skipping"
+      echo "[GPU ${gpu}|EGL ${egl_id}] ${run_name} — completed (step ${saved_step}), skipping"
       return 0
     else
-      echo "[GPU ${gpu}] ${run_name} — resuming from step ${saved_step}"
+      echo "[GPU ${gpu}|EGL ${egl_id}] ${run_name} — resuming from step ${saved_step}"
       resume_flag="--resume --config_path=${run_dir}/checkpoints/last/pretrained_model/train_config.json"
     fi
   fi
@@ -169,6 +190,7 @@ run_task() {
     --dataset.repo_id="$REPO_ID"
     --dataset.episodes="$ALL_EPISODES"
     --policy.type="$policy_type"
+    --policy.device="cuda:${gpu}"
     --policy.vision_backbone=resnet50
     --policy.freeze_backbone=true
     --policy.ssl_checkpoint_path="$SSL_URL"
@@ -206,10 +228,10 @@ run_task() {
     cmd+=($resume_flag)
   fi
 
-  echo "[GPU ${gpu}] ${run_name} (${policy}, ${degrade}, multi-task ${NUM_TASKS} tasks)"
+  echo "[GPU ${gpu}|EGL ${egl_id}] ${run_name} (${policy}, ${degrade}, multi-task ${NUM_TASKS} tasks)"
 
   if [[ -n "${DRY_RUN:-}" ]]; then
-    printf 'CUDA_VISIBLE_DEVICES=%s ' "$gpu"
+    printf 'RENDER_GPU_DEVICE_ID=%s ' "$egl_id"
     printf '%q ' "${cmd[@]}"
     echo
     return 0
