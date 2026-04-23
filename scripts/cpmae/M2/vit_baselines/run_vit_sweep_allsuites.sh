@@ -34,9 +34,9 @@ NUM_EACH_GPU=1
 PARALLEL=$((NUM_EACH_GPU * ${#GPUS[@]}))
 
 # ── Hyperparameters (fixed) ────────────────────────────────────────
-STEPS=100
-EVAL_FREQ=50
-SAVE_FREQ=25000
+STEPS=100000
+EVAL_FREQ=25000
+SAVE_FREQ=100000
 N_EVAL_EPISODES=20
 EVAL_BATCH=20
 BATCH_SIZE=64
@@ -200,10 +200,10 @@ fi
 EGL_PROBE_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/egl_probe.py"
 if [[ -z "${DRY_RUN:-}" ]]; then
     echo "Loading EGL device mapping..."
-    EGL_MAP_JSON=$(python3 "$EGL_PROBE_SCRIPT")
+    EGL_MAP_JSON=$(python3 "$EGL_PROBE_SCRIPT" | grep -E '^\{.*\}$' | tail -1)
     echo "EGL mapping (CUDA GPU -> EGL device): ${EGL_MAP_JSON}"
     for gpu in "${GPUS[@]}"; do
-        egl_id=$(python3 -c "import json; m=json.loads('${EGL_MAP_JSON}'); print(m.get('${gpu}', '${gpu}'))")
+        egl_id=$(python3 -c "import json,sys; m=json.loads(sys.argv[1]); print(m.get(sys.argv[2], sys.argv[2]))" "$EGL_MAP_JSON" "$gpu")
         export "EGL_MAP_${gpu}=${egl_id}"
         echo "  CUDA GPU ${gpu} -> EGL device ${egl_id}"
     done
@@ -292,7 +292,7 @@ run_task() {
     # DINOv2 models are larger and OOM at bs=64; halve batch size and accumulate 2x.
     case "$backbone" in
         dinov2_*)
-            cmd+=(--batch_size=32 --gradient_accumulation_steps=2)
+            cmd+=(--batch_size=16 --gradient_accumulation_steps=4)
             ;;
     esac
 

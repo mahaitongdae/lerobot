@@ -324,7 +324,7 @@ class MAE(nn.Module):
                 variance before computing MSE (per He et al. 2022, MAE paper).
 
         Returns:
-            loss: reconstruction MSE on masked patches
+            per_sample_loss: (B,) per-sample masked MSE
             pred: (B, N, patch_size^2 * 3) predictions
         """
         encoded, ids_restore = self.encoder(imgs, mask)
@@ -336,12 +336,12 @@ class MAE(nn.Module):
             var = target.var(dim=-1, keepdim=True)
             target = (target - mean) / (var + 1e-6).sqrt()
 
-        # Loss on masked patches only
+        # Per-sample masked MSE: average over masked patches per sample
         loss_mask = 1.0 - mask.float()  # 1 where masked
-        loss = ((pred - target) ** 2).mean(dim=-1)  # (B, N)
-        loss = (loss * loss_mask).sum() / loss_mask.sum().clamp(min=1)
+        patch_mse = ((pred - target) ** 2).mean(dim=-1)  # (B, N)
+        per_sample_loss = (patch_mse * loss_mask).sum(dim=1) / loss_mask.sum(dim=1).clamp(min=1)
 
-        return loss, pred
+        return per_sample_loss, pred
 
 
 # Dataset for MAE pretraining
@@ -366,11 +366,34 @@ class LiberoImageDataset(Dataset):
         self.contact_labels = {}
         if contact_labels_dir is not None:
             contact_dir = Path(contact_labels_dir)
-            for label_file in sorted(contact_dir.glob("task_*_contacts.json")):
+            label_files = sorted(contact_dir.glob("task_*_contacts.json"))
+            if not label_files:
+                raise FileNotFoundError(
+                    f"No contact label files found in {contact_labels_dir}. "
+                    "Run: python scripts/cpmae/contact_detector.py --all_tasks"
+                )
+            for label_file in label_files:
                 with open(label_file) as f:
                     data = json.load(f)
                 for ep_str, ep_data in data["episodes"].items():
                     self.contact_labels[int(ep_str)] = ep_data["labels"]
+            # Validate coverage: warn if dataset episodes are missing labels
+            dataset_episodes = set()
+            for i in range(len(self.dataset)):
+                ep = self.dataset[i].get("episode_index", None)
+                if ep is not None:
+                    dataset_episodes.add(ep.item() if torch.is_tensor(ep) else ep)
+                if len(dataset_episodes) > 500:
+                    break  # sample check, not exhaustive
+            labeled_episodes = set(self.contact_labels.keys())
+            missing = dataset_episodes - labeled_episodes
+            if missing:
+                n_missing = len(missing)
+                print(
+                    f"WARNING: {n_missing} sampled episode(s) have no contact labels "
+                    f"(e.g. {sorted(missing)[:5]}). These will default to transit. "
+                    f"Labeled: {len(labeled_episodes)}, sampled: {len(dataset_episodes)}."
+                )
 
     def __len__(self):
         return len(self.dataset)
@@ -563,9 +586,12 @@ def train_mae(args):
     total_steps = args.epochs * len(dataloader)
 
     def lr_schedule(step):
-        if step < warmup_steps:
-            return step / max(1, warmup_steps)
-        progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+        # step is 0-indexed from LambdaLR; use step+1 so the first update
+        # gets a non-zero warmup multiplier instead of full base LR.
+        s = step + 1
+        if s <= warmup_steps:
+            return s / warmup_steps
+        progress = (s - warmup_steps) / max(1, total_steps - warmup_steps)
         return 0.5 * (1 + math.cos(math.pi * progress))
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_schedule)
@@ -582,6 +608,7 @@ def train_mae(args):
         epoch_transit_loss = 0.0
         n_contact = 0
         n_transit = 0
+        n_batches = 0
         t0 = time.time()
 
         for batch in dataloader:
@@ -608,35 +635,27 @@ def train_mae(args):
                         device=device,
                     )
 
-                # Split-batch forward: run contact and transit sub-batches separately
-                # so each group has consistent visible-patch count for the encoder.
+                # Split-batch forward: contact and transit sub-batches run
+                # separately so each group has consistent visible-patch count.
                 per_sample_loss = torch.zeros(B, device=device)
 
-                def _per_sample_loss(sub_imgs, sub_mask):
-                    """Forward + per-sample masked MSE for a sub-batch."""
-                    _, sub_pred = model(sub_imgs, sub_mask, normalize_target=args.normalize_target)
-                    sub_target = model.patchify(sub_imgs)
-                    if args.normalize_target:
-                        mean = sub_target.mean(dim=-1, keepdim=True)
-                        var = sub_target.var(dim=-1, keepdim=True)
-                        sub_target = (sub_target - mean) / (var + 1e-6).sqrt()
-                    sub_loss_mask = 1.0 - sub_mask
-                    per_s = ((sub_pred - sub_target) ** 2).mean(dim=-1)
-                    return (per_s * sub_loss_mask).sum(dim=1) / sub_loss_mask.sum(dim=1).clamp(min=1)
-
                 if len(contact_idx) > 0:
-                    per_sample_loss[contact_idx] = _per_sample_loss(imgs[contact_idx], mask[contact_idx])
+                    sub_loss, _ = model(imgs[contact_idx], mask[contact_idx],
+                                        normalize_target=args.normalize_target)
+                    per_sample_loss[contact_idx] = sub_loss
 
                 if len(transit_idx) > 0:
-                    per_sample_loss[transit_idx] = _per_sample_loss(imgs[transit_idx], mask[transit_idx])
+                    sub_loss, _ = model(imgs[transit_idx], mask[transit_idx],
+                                        normalize_target=args.normalize_target)
+                    per_sample_loss[transit_idx] = sub_loss
 
-                # Apply contact-weighted loss
+                # Weighted mean over samples
                 weights = torch.where(
                     is_contact.bool(),
                     torch.tensor(args.contact_loss_weight, device=device),
                     torch.tensor(1.0, device=device),
                 )
-                loss = (per_sample_loss * weights).sum() / weights.sum()
+                loss = (per_sample_loss * weights).mean()
 
                 # Track per-phase losses
                 if len(contact_idx) > 0:
@@ -646,8 +665,10 @@ def train_mae(args):
                     epoch_transit_loss += per_sample_loss[transit_idx].sum().item()
                     n_transit += len(transit_idx)
             else:
+                # Uniform MAE: same per-sample reduction, then batch mean
                 mask = generate_mask(B, n_patches, args.uniform_mask_ratio, device)
-                loss, pred = model(imgs, mask, normalize_target=args.normalize_target)
+                per_sample_loss, _ = model(imgs, mask, normalize_target=args.normalize_target)
+                loss = per_sample_loss.mean()
 
             optimizer.zero_grad()
             loss.backward()
@@ -655,10 +676,11 @@ def train_mae(args):
             optimizer.step()
             scheduler.step()
 
-            epoch_loss += loss.item() * B
+            epoch_loss += loss.item()
+            n_batches += 1
             global_step += 1
 
-        epoch_loss /= len(dataset)
+        epoch_loss /= n_batches
         dt = time.time() - t0
 
         log_entry = {
@@ -668,7 +690,7 @@ def train_mae(args):
             "time_s": dt,
         }
 
-        if args.mode == "cpmae":
+        if args.mode in ("cpmae", "hybrid"):
             if n_contact > 0:
                 log_entry["contact_loss"] = epoch_contact_loss / n_contact
             if n_transit > 0:

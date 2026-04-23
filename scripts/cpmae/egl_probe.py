@@ -140,8 +140,15 @@ def main():
     parser.add_argument("--force", action="store_true", help="Ignore cache, re-probe")
     args = parser.parse_args()
 
-    mapping = get_egl_mapping(force=args.force)
-    # Print JSON to stdout (clean, no stderr noise) for consumption by bash scripts
+    # Redirect stdout→stderr during probe to suppress library noise (e.g.
+    # LIBERO's "[info] using task orders ..." printed to stdout).
+    real_stdout = sys.stdout
+    sys.stdout = sys.stderr
+    try:
+        mapping = get_egl_mapping(force=args.force)
+    finally:
+        sys.stdout = real_stdout
+
     print(json.dumps(mapping))
 
 

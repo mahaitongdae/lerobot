@@ -140,7 +140,7 @@ echo ""
 
 # Export as flattened vars for env_parallel
 for gpu in "${GPUS[@]}"; do
-    egl_id=$(python3 -c "import json; m=json.loads('${EGL_MAP_JSON}'); print(m.get('${gpu}', '${gpu}'))")
+    egl_id=$(python3 -c "import json,sys; m=json.loads(sys.argv[1]); print(m.get(sys.argv[2], sys.argv[2]))" "$EGL_MAP_JSON" "$gpu")
     export "EGL_MAP_${gpu}=${egl_id}"
     echo "  CUDA GPU ${gpu} -> EGL device ${egl_id}"
 done
