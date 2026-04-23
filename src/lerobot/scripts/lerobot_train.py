@@ -30,8 +30,7 @@ from lerobot.configs.train import TrainPipelineConfig
 from lerobot.datasets.factory import make_dataset
 from lerobot.datasets.sampler import EpisodeAwareSampler
 from lerobot.datasets.utils import cycle
-from lerobot.envs.factory import make_env, make_env_pre_post_processors
-from lerobot.envs.utils import close_envs
+from lerobot.envs.factory import make_env_factories, make_env_pre_post_processors
 from lerobot.optim.factory import make_optimizer_and_scheduler
 from lerobot.policies.factory import make_policy, make_pre_post_processors
 from lerobot.policies.pretrained import PreTrainedPolicy
@@ -227,21 +226,20 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     # Create environment used for evaluating checkpoints during training on simulation data.
     # On real-world data, no need to create an environment as evaluations are done outside train.py,
     # using the eval.py instead, with gym_dora environment and dora-rs.
-    eval_env = None
+    env_factories = None
     dataset_task_index_map = None
     if cfg.eval_freq > 0 and cfg.env is not None and is_main_process:
-        logging.info("Creating env")
-        eval_env = make_env(cfg.env, n_envs=cfg.eval.batch_size, use_async_envs=cfg.eval.use_async_envs)
-        # Build dataset_task_index_map for multi-task eval (LIBERO only)
+        logging.info("Preparing environment factories")
+        env_factories = make_env_factories(cfg.env, n_envs=cfg.eval.batch_size, use_async_envs=cfg.eval.use_async_envs)
         if (
-            isinstance(eval_env, dict)
+            isinstance(env_factories, dict)
             and getattr(cfg.policy, "num_tasks", None) is not None
         ):
             try:
                 from lerobot.envs.libero import build_dataset_task_index_map
 
                 dataset_task_index_map = build_dataset_task_index_map(
-                    eval_env, dataset.meta.tasks
+                    env_factories, dataset.meta.tasks
                 )
                 logging.info("Built dataset_task_index_map: %s", dataset_task_index_map)
             except Exception:
@@ -515,7 +513,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                 logging.info(f"Eval policy at step {step}")
                 with torch.no_grad(), accelerator.autocast():
                     eval_info = eval_policy_all(
-                        envs=eval_env,  # dict[suite][task_id] -> vec_env
+                        env_factories=env_factories,
                         policy=accelerator.unwrap_model(policy),
                         env_preprocessor=env_preprocessor,
                         env_postprocessor=env_postprocessor,
@@ -558,9 +556,6 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                     wandb_logger.log_video(eval_info["overall"]["video_paths"][0], step, mode="eval")
 
             accelerator.wait_for_everyone()
-
-    if eval_env:
-        close_envs(eval_env)
 
     if is_main_process:
         logging.info("End of training")
