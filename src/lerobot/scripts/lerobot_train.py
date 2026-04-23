@@ -47,8 +47,10 @@ from lerobot.utils.train_utils import (
     save_checkpoint,
     update_last_checkpoint,
 )
+from lerobot.processor.device_processor import DeviceProcessorStep
 from lerobot.utils.utils import (
     format_big_number,
+    get_safe_torch_device,
     has_method,
     init_logging,
 )
@@ -181,6 +183,12 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         # Accelerate auto-detects the device based on the available hardware and ignores the policy.device setting.
         # Force the device to be CPU when policy.device is set to CPU.
         force_cpu = cfg.policy.device == "cpu"
+        # When a specific CUDA device is requested (e.g. "cuda:2"), set it as the
+        # default so that Accelerator.device and .prepare() use the correct GPU
+        # instead of always defaulting to cuda:0.
+        if not force_cpu and cfg.policy.device.startswith("cuda:"):
+            cuda_idx = int(cfg.policy.device.split(":")[1])
+            torch.cuda.set_device(cuda_idx)
         accelerator = Accelerator(
             step_scheduler_with_optimizer=False,
             kwargs_handlers=[ddp_kwargs],
@@ -413,6 +421,18 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     policy, optimizer, dataloader, lr_scheduler = accelerator.prepare(
         policy, optimizer, dataloader, lr_scheduler
     )
+
+    # accelerator.prepare may move the model to a different device than cfg.policy.device
+    # (e.g. Accelerator auto-selects cuda:0 even if policy.device is cuda:N).
+    # Sync the preprocessor's DeviceProcessorStep so observations land on the same device.
+    actual_device = accelerator.device
+    for proc_step in preprocessor.steps:
+        if isinstance(proc_step, DeviceProcessorStep):
+            proc_step.tensor_device = get_safe_torch_device(str(actual_device))
+            proc_step.device = str(actual_device)
+            proc_step.non_blocking = "cuda" in str(actual_device)
+            break
+
     dl_iter = cycle(dataloader)
 
     policy.train()

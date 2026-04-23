@@ -315,11 +315,13 @@ class MAE(nn.Module):
         x = x.permute(0, 2, 4, 3, 5, 1).reshape(B, h * w, p * p * C)
         return x
 
-    def forward(self, imgs, mask):
+    def forward(self, imgs, mask, normalize_target=False):
         """
         Args:
             imgs: (B, C, H, W)
             mask: (B, N) binary mask. 1 = visible, 0 = masked.
+            normalize_target: If True, normalize each patch to zero mean / unit
+                variance before computing MSE (per He et al. 2022, MAE paper).
 
         Returns:
             loss: reconstruction MSE on masked patches
@@ -328,6 +330,11 @@ class MAE(nn.Module):
         encoded, ids_restore = self.encoder(imgs, mask)
         pred = self.decoder(encoded, ids_restore)
         target = self.patchify(imgs)
+
+        if normalize_target:
+            mean = target.mean(dim=-1, keepdim=True)
+            var = target.var(dim=-1, keepdim=True)
+            target = (target - mean) / (var + 1e-6).sqrt()
 
         # Loss on masked patches only
         loss_mask = 1.0 - mask.float()  # 1 where masked
@@ -446,6 +453,57 @@ def generate_cpmae_mask(is_contact, n_patches, contact_mask_ratio, transit_mask_
     return mask, contact_idx, transit_idx
 
 
+def generate_hybrid_mask(is_contact, n_patches, grid_size, contact_mask_ratio, transit_mask_ratio,
+                         gripper_rows=4, device="cpu"):
+    """Spatial-contact hybrid masking.
+
+    For contact frames: higher mask ratio in the gripper region (bottom rows),
+    standard mask ratio elsewhere. Transit frames get uniform masking.
+    This preserves scene-level spatial features while still emphasizing contact regions.
+
+    Args:
+        gripper_rows: Number of bottom patch rows considered the gripper region.
+            For 14x14 grid, 4 rows = bottom ~29% of the image.
+    """
+    B = is_contact.shape[0]
+    contact_idx = (is_contact == 1).nonzero(as_tuple=True)[0]
+    transit_idx = (is_contact == 0).nonzero(as_tuple=True)[0]
+
+    h = w = grid_size
+    # Identify gripper-region patch indices (bottom rows)
+    gripper_patches = []
+    for row in range(h - gripper_rows, h):
+        for col in range(w):
+            gripper_patches.append(row * w + col)
+    gripper_patches = torch.tensor(gripper_patches, device=device)
+    scene_patches = torch.tensor([i for i in range(n_patches) if i not in gripper_patches], device=device)
+    n_gripper = len(gripper_patches)
+    n_scene = len(scene_patches)
+
+    mask = torch.zeros(B, n_patches, device=device)
+
+    if len(contact_idx) > 0:
+        n_c = len(contact_idx)
+        # Gripper region: high mask ratio; Scene region: standard mask ratio
+        n_vis_gripper = max(1, int(n_gripper * (1 - contact_mask_ratio)))
+        n_vis_scene = max(1, int(n_scene * (1 - transit_mask_ratio)))
+        for j, i in enumerate(contact_idx):
+            gp = gripper_patches[torch.randperm(n_gripper, device=device)[:n_vis_gripper]]
+            sp = scene_patches[torch.randperm(n_scene, device=device)[:n_vis_scene]]
+            mask[i].scatter_(0, gp, 1.0)
+            mask[i].scatter_(0, sp, 1.0)
+
+    if len(transit_idx) > 0:
+        n_t = len(transit_idx)
+        n_visible_t = int(n_patches * (1 - transit_mask_ratio))
+        noise_t = torch.rand(n_t, n_patches, device=device)
+        ids_t = noise_t.argsort(dim=1)
+        for j, i in enumerate(transit_idx):
+            mask[i].scatter_(0, ids_t[j, :n_visible_t], 1.0)
+
+    return mask, contact_idx, transit_idx
+
+
 def train_mae(args):
     device = torch.device(f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu")
     output_dir = Path(args.output_dir)
@@ -456,7 +514,7 @@ def train_mae(args):
     print(f"Device: {device}")
 
     # Dataset
-    contact_labels_dir = args.contact_labels_dir if args.mode == "cpmae" else None
+    contact_labels_dir = args.contact_labels_dir if args.mode in ("cpmae", "hybrid") else None
     dataset = LiberoImageDataset(
         repo_id=args.repo_id,
         image_key=args.image_key,
@@ -532,38 +590,45 @@ def train_mae(args):
             B = imgs.shape[0]
 
             # Generate masks and compute loss
-            if args.mode == "cpmae":
-                mask, contact_idx, transit_idx = generate_cpmae_mask(
-                    is_contact, n_patches,
-                    contact_mask_ratio=args.contact_mask_ratio,
-                    transit_mask_ratio=args.transit_mask_ratio,
-                    device=device,
-                )
+            if args.mode in ("cpmae", "hybrid"):
+                if args.mode == "cpmae":
+                    mask, contact_idx, transit_idx = generate_cpmae_mask(
+                        is_contact, n_patches,
+                        contact_mask_ratio=args.contact_mask_ratio,
+                        transit_mask_ratio=args.transit_mask_ratio,
+                        device=device,
+                    )
+                else:
+                    grid_size = args.img_size // args.patch_size
+                    mask, contact_idx, transit_idx = generate_hybrid_mask(
+                        is_contact, n_patches, grid_size,
+                        contact_mask_ratio=args.contact_mask_ratio,
+                        transit_mask_ratio=args.transit_mask_ratio,
+                        gripper_rows=args.hybrid_gripper_rows,
+                        device=device,
+                    )
 
                 # Split-batch forward: run contact and transit sub-batches separately
                 # so each group has consistent visible-patch count for the encoder.
                 per_sample_loss = torch.zeros(B, device=device)
 
+                def _per_sample_loss(sub_imgs, sub_mask):
+                    """Forward + per-sample masked MSE for a sub-batch."""
+                    _, sub_pred = model(sub_imgs, sub_mask, normalize_target=args.normalize_target)
+                    sub_target = model.patchify(sub_imgs)
+                    if args.normalize_target:
+                        mean = sub_target.mean(dim=-1, keepdim=True)
+                        var = sub_target.var(dim=-1, keepdim=True)
+                        sub_target = (sub_target - mean) / (var + 1e-6).sqrt()
+                    sub_loss_mask = 1.0 - sub_mask
+                    per_s = ((sub_pred - sub_target) ** 2).mean(dim=-1)
+                    return (per_s * sub_loss_mask).sum(dim=1) / sub_loss_mask.sum(dim=1).clamp(min=1)
+
                 if len(contact_idx) > 0:
-                    c_imgs = imgs[contact_idx]
-                    c_mask = mask[contact_idx]
-                    c_loss_raw, c_pred = model(c_imgs, c_mask)
-                    # Compute per-sample loss for contact
-                    c_target = model.patchify(c_imgs)
-                    c_loss_mask = 1.0 - c_mask
-                    c_per_sample = ((c_pred - c_target) ** 2).mean(dim=-1)
-                    c_per_sample = (c_per_sample * c_loss_mask).sum(dim=1) / c_loss_mask.sum(dim=1).clamp(min=1)
-                    per_sample_loss[contact_idx] = c_per_sample
+                    per_sample_loss[contact_idx] = _per_sample_loss(imgs[contact_idx], mask[contact_idx])
 
                 if len(transit_idx) > 0:
-                    t_imgs = imgs[transit_idx]
-                    t_mask = mask[transit_idx]
-                    t_loss_raw, t_pred = model(t_imgs, t_mask)
-                    t_target = model.patchify(t_imgs)
-                    t_loss_mask = 1.0 - t_mask
-                    t_per_sample = ((t_pred - t_target) ** 2).mean(dim=-1)
-                    t_per_sample = (t_per_sample * t_loss_mask).sum(dim=1) / t_loss_mask.sum(dim=1).clamp(min=1)
-                    per_sample_loss[transit_idx] = t_per_sample
+                    per_sample_loss[transit_idx] = _per_sample_loss(imgs[transit_idx], mask[transit_idx])
 
                 # Apply contact-weighted loss
                 weights = torch.where(
@@ -582,7 +647,7 @@ def train_mae(args):
                     n_transit += len(transit_idx)
             else:
                 mask = generate_mask(B, n_patches, args.uniform_mask_ratio, device)
-                loss, pred = model(imgs, mask)
+                loss, pred = model(imgs, mask, normalize_target=args.normalize_target)
 
             optimizer.zero_grad()
             loss.backward()
@@ -655,8 +720,8 @@ def main():
     parser = argparse.ArgumentParser(description="CP-MAE / Uniform MAE Pretraining")
 
     # Mode
-    parser.add_argument("--mode", type=str, required=True, choices=["cpmae", "uniform"],
-                        help="Pretraining mode: cpmae or uniform")
+    parser.add_argument("--mode", type=str, required=True, choices=["cpmae", "uniform", "hybrid"],
+                        help="Pretraining mode: cpmae, uniform, or hybrid (spatial-contact)")
     parser.add_argument("--output_dir", type=str, required=True, help="Output directory")
 
     # Data
@@ -679,6 +744,12 @@ def main():
     parser.add_argument("--contact_mask_ratio", type=float, default=0.90)
     parser.add_argument("--transit_mask_ratio", type=float, default=0.75)
     parser.add_argument("--contact_loss_weight", type=float, default=2.0)
+    parser.add_argument("--normalize_target", action="store_true",
+                        help="Per-patch normalize targets to zero mean / unit var (He et al. 2022)")
+    parser.add_argument("--contact_only_transitions", action="store_true",
+                        help="Narrow contact labels to transition windows only (not all gripper-closed)")
+    parser.add_argument("--hybrid_gripper_rows", type=int, default=4,
+                        help="Number of bottom patch rows treated as gripper region in hybrid masking")
 
     # Training
     parser.add_argument("--epochs", type=int, default=400)

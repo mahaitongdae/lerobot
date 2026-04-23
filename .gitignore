@@ -189,3 +189,4 @@ vast-instances.json
 research-wiki/*
 .claude/*
 MUJOCO_LOG.TXT
+.egl_probe/

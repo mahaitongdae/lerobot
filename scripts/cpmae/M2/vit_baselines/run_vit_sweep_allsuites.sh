@@ -61,7 +61,7 @@ VOLTRON_CACHE_DIR="${VOLTRON_CACHE_DIR:-$HOME/.voltron}"
 
 # ── Suite & backbone lists ────────────────────────────────────────
 SUITES=(libero_10)  #  libero_spatial libero_object libero_goal
-BACKBONES=(mocov3_vits mvp_vits vc1_vitb voltron_vcond) # dinov2_vits dinov2_vitb siglip_vitb 
+BACKBONES=(dinov2_vits mocov3_vits vc1_vitb voltron_vcond) # dinov2_vits dinov2_vitb siglip_vitb  mvp_vits
 
 MAPPING_JSON="scripts/cpmae/task_mapping.json"
 
@@ -165,7 +165,7 @@ if [[ -z "${DRY_RUN:-}" ]]; then
     echo "  ${fname} — done (${size_bytes} bytes)"
   }
 
-  for url in "$MOCOV3_VITS_URL" "$MVP_VITS_URL" "$VC1_VITB_URL"; do
+  for url in "$MOCOV3_VITS_URL" "$VC1_VITB_URL"; do
     download_and_validate "$url"
   done
   echo ""
@@ -288,6 +288,13 @@ run_task() {
         cpmae_*)  norm_preset="identity" ;;
     esac
     cmd+=(--policy.backbone_input_norm="$norm_preset")
+
+    # DINOv2 models are larger and OOM at bs=64; halve batch size and accumulate 2x.
+    case "$backbone" in
+        dinov2_*)
+            cmd+=(--batch_size=32 --gradient_accumulation_steps=2)
+            ;;
+    esac
 
     # Add backbone-specific flags
     case "$backbone" in
