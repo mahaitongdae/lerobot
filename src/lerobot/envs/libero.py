@@ -15,6 +15,7 @@
 # limitations under the License.
 from __future__ import annotations
 
+import logging
 import os
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -238,17 +239,17 @@ class LiberoEnv(gym.Env):
 
         # Direct EGL rendering to the correct GPU.
         # EGL device ordering does NOT match CUDA device ordering.
-        # Use RENDER_GPU_DEVICE_ID env var (the correct EGL index) if set,
-        # otherwise fall back to CUDA_VISIBLE_DEVICES (may land on wrong GPU).
+        # Set RENDER_GPU_DEVICE_ID to the correct EGL index (use the EGL probe
+        # in run_eval.sh to discover the mapping).
         render_device = os.environ.get("RENDER_GPU_DEVICE_ID", "")
         if render_device and render_device.isdigit():
             env_args["render_gpu_device_id"] = int(render_device)
         else:
-            cuda_vis = os.environ.get("CUDA_VISIBLE_DEVICES", "")
-            if cuda_vis:
-                gpu_ids = [int(x) for x in cuda_vis.split(",") if x.strip().isdigit()]
-                if gpu_ids:
-                    env_args["render_gpu_device_id"] = gpu_ids[0]
+            logging.warning(
+                "RENDER_GPU_DEVICE_ID is not set. EGL rendering may land on the wrong GPU. "
+                "Run the EGL probe (scripts/cpmae/run_eval.sh) to find the correct mapping "
+                "and set RENDER_GPU_DEVICE_ID=<egl_id> before launching."
+            )
 
         env = OffScreenRenderEnv(**env_args)
         env.reset()

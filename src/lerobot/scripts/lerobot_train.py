@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import dataclasses
+import json
 import logging
 import time
 from contextlib import nullcontext
@@ -435,6 +436,8 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         accelerator=accelerator,
     )
 
+    best_pc_success = -1.0
+
     if is_main_process:
         logging.info(
             f"Start offline training on a fixed dataset, with effective batch size: {effective_batch_size}"
@@ -533,7 +536,16 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                 for suite, suite_info in eval_info.items():
                     logging.info("Suite %s aggregated: %s", suite, suite_info)
 
-                # meters/tracker
+                # Save eval_info.json before popping keys from aggregated
+                eval_json_dir = cfg.output_dir / "eval" / f"step_{step_id}"
+                eval_json_dir.mkdir(parents=True, exist_ok=True)
+                with open(eval_json_dir / "eval_info.json", "w") as f:
+                    json.dump(eval_info, f, indent=2)
+                logging.info("Saved eval_info.json to %s", eval_json_dir)
+
+                current_pc_success = aggregated["pc_success"]
+
+                # meters/tracker (pop keys consumed by the tracker)
                 eval_metrics = {
                     "avg_sum_reward": AverageMeter("∑rwrd", ":.3f"),
                     "pc_success": AverageMeter("success", ":.1f"),
@@ -550,6 +562,26 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                 eval_tracker.eval_s = aggregated.pop("eval_s")
                 eval_tracker.avg_sum_reward = aggregated.pop("avg_sum_reward")
                 eval_tracker.pc_success = aggregated.pop("pc_success")
+                if current_pc_success > best_pc_success:
+                    best_pc_success = current_pc_success
+                    best_dir = cfg.output_dir / "checkpoints" / "best"
+                    logging.info(
+                        "New best pc_success=%.2f at step %d, saving to %s",
+                        best_pc_success, step, best_dir,
+                    )
+                    save_checkpoint(
+                        checkpoint_dir=best_dir,
+                        step=step,
+                        cfg=cfg,
+                        policy=accelerator.unwrap_model(policy),
+                        optimizer=optimizer,
+                        scheduler=lr_scheduler,
+                        preprocessor=preprocessor,
+                        postprocessor=postprocessor,
+                    )
+                    with open(best_dir / "eval_info.json", "w") as f:
+                        json.dump(eval_info, f, indent=2)
+
                 if wandb_logger:
                     wandb_log_dict = {**eval_tracker.to_dict(), **eval_info}
                     wandb_logger.log_dict(wandb_log_dict, step, mode="eval")

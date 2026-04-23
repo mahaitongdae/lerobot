@@ -232,18 +232,30 @@ def load_mocov3_weights_into_vit(vit_model: nn.Module, checkpoint_path: str) -> 
     target_keys = set(vit_model.state_dict().keys())
     remapped = {k: v for k, v in remapped.items() if k in target_keys}
 
-    if len(remapped) == 0:
-        sample_keys = list(raw_sd.keys())[:10]
+    # Hard-fail guard: a timm-style ViT checkpoint (MoCo v3 / MVP / VC-1) should cover at
+    # least half of the target parameter tensors after remapping. If it covers fewer, the
+    # checkpoint layout is not what we assume (wrong wrapper prefix, wrong architecture,
+    # or a corrupted download), and proceeding would silently leave most of the backbone
+    # randomly initialized. Refuse to continue rather than log and move on.
+    min_required = max(1, len(target_keys) // 2)
+    if len(remapped) < min_required:
+        sample_raw = list(raw_sd.keys())[:10]
+        sample_matched = list(remapped.keys())[:10]
         raise RuntimeError(
-            f"Could not match any MoCo v3 checkpoint keys to the ViT backbone. "
-            f"Sample checkpoint keys: {sample_keys}"
+            f"MoCo v3 / MVP / VC-1 checkpoint {checkpoint_path!r} matched only "
+            f"{len(remapped)} / {len(target_keys)} ViT parameter tensors "
+            f"(required at least {min_required}). This almost certainly means the "
+            f"checkpoint has an unexpected wrapper prefix or key layout. "
+            f"Sample raw keys: {sample_raw}. "
+            f"Sample matched keys: {sample_matched}."
         )
 
     missing, unexpected = vit_model.load_state_dict(remapped, strict=False)
     logger.info(
-        "Loaded MoCo v3 ViT weights from %s. matched=%d, missing=%d, unexpected=%d",
+        "Loaded MoCo v3 ViT weights from %s. matched=%d/%d, missing=%d, unexpected=%d",
         os.path.basename(checkpoint_path) if not checkpoint_path.startswith("http") else checkpoint_path,
         len(remapped),
+        len(target_keys),
         len(missing),
         len(unexpected),
     )

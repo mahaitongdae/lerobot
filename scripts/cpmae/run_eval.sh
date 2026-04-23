@@ -19,6 +19,9 @@
 #   RESULTS_DIR=results/foo RESULTS_PREFIX=SSL_act_ CHECKPOINT_MODE=all bash .../run_eval_ssl_sweep_allsuites.sh 0
 #   DRY_RUN=1 bash scripts/cpmae/run_eval_ssl_sweep_allsuites.sh --checkpoints last 0 1
 
+#   RESULTS_DIR=results/foo RESULTS_PREFIX=SSL_act_ CHECKPOINT_MODE=all bash .../run_eval_ssl_sweep_allsuites.sh 0
+
+
 set -euo pipefail
 
 # ── Defaults (CLI parsing may override) ───────────────────────────

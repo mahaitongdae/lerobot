@@ -190,6 +190,7 @@ run_task() {
             --policy.type=act
             --policy.vision_backbone=resnet50
             --policy.freeze_backbone=true
+            --policy.backbone_input_norm=imagenet
             --policy.num_tasks="$num_tasks"
             --policy.task_embed_dim=64
             --policy.task_index_offset="$task_index_offset"
@@ -205,7 +206,6 @@ run_task() {
             --eval.batch_size="$EVAL_BATCH"
             --seed="$SEED"
             --policy.optimizer_lr="$LR"
-            --policy.optimizer_lr_backbone="$LR"
             --output_dir="$run_dir"
             --job_name="$run_name"
             --wandb.enable=true
@@ -221,6 +221,7 @@ run_task() {
             --policy.vision_backbone=resnet50
             --policy.freeze_backbone=true
             --policy.use_group_norm=false
+            --policy.backbone_input_norm=imagenet
             --policy.num_tasks="$num_tasks"
             --policy.task_embed_dim=64
             --policy.task_index_offset="$task_index_offset"

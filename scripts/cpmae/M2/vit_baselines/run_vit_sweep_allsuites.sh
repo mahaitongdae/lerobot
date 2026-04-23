@@ -34,11 +34,11 @@ NUM_EACH_GPU=1
 PARALLEL=$((NUM_EACH_GPU * ${#GPUS[@]}))
 
 # ── Hyperparameters (fixed) ────────────────────────────────────────
-STEPS=100000
-EVAL_FREQ=0
+STEPS=100
+EVAL_FREQ=50
 SAVE_FREQ=25000
 N_EVAL_EPISODES=20
-EVAL_BATCH=10
+EVAL_BATCH=20
 BATCH_SIZE=64
 LR=5e-5
 SEED=42
@@ -47,17 +47,21 @@ REPO_ID="HuggingFaceVLA/libero"
 
 # ── ViT backbone definitions ─────────────────────────────────────
 # MoCo v3 ViT-S checkpoint URL
-MOCOV3_VITS_URL="https://dl.fbaipublicfiles.com/moco-v3/vit-s-300ep/vit-s-300ep.pth.tar"
-# MVP ViT-S MAE checkpoint (ego-hoi, 22M params, 384-dim)
-MVP_VITS_URL="https://berkeley.box.com/shared/static/m93ynem558jo8vltlads5rcmnahgsyzr.pth"
+MOCOV3_VITS_URL="${MOCOV3_VITS_URL:-https://dl.fbaipublicfiles.com/moco-v3/vit-s-300ep/vit-s-300ep.pth.tar}"
+# MVP ViT-S MAE checkpoint (ego-hoi, 22M params, 384-dim).
+# The official URL is a Berkeley Box share link that is flaky under automated
+# downloads (often returns HTML instead of the file). Override with a mirror by
+# setting MVP_VITS_URL=<your-mirror> in the environment, or pre-place the file at
+# ~/.cache/torch/hub/checkpoints/m93ynem558jo8vltlads5rcmnahgsyzr.pth.
+MVP_VITS_URL="${MVP_VITS_URL:-https://berkeley.box.com/shared/static/m93ynem558jo8vltlads5rcmnahgsyzr.pth}"
 # VC-1 ViT-B MAE checkpoint (ego4d+imagenet, 86M params, 768-dim)
-VC1_VITB_URL="https://dl.fbaipublicfiles.com/eai-vc/vc1_vitb.pth"
+VC1_VITB_URL="${VC1_VITB_URL:-https://dl.fbaipublicfiles.com/eai-vc/vc1_vitb.pth}"
 # Voltron cache directory (the voltron-robotics package downloads to `cache/` by default)
 VOLTRON_CACHE_DIR="${VOLTRON_CACHE_DIR:-$HOME/.voltron}"
 
 # ── Suite & backbone lists ────────────────────────────────────────
-SUITES=(libero_10 libero_spatial libero_object libero_goal)
-BACKBONES=(dinov2_vits dinov2_vitb siglip_vitb mocov3_vits mvp_vits vc1_vitb voltron_vcond)
+SUITES=(libero_10)  #  libero_spatial libero_object libero_goal
+BACKBONES=(mocov3_vits mvp_vits vc1_vitb voltron_vcond) # dinov2_vits dinov2_vitb siglip_vitb 
 
 MAPPING_JSON="scripts/cpmae/task_mapping.json"
 
@@ -86,22 +90,83 @@ done
 echo ""
 
 # ── Pre-download ViT checkpoints ─────────────────────────────────
+# We download with curl + strict integrity checks instead of
+# `torch.hub.load_state_dict_from_url` because:
+#   (1) Box share links sometimes return an HTML redirect/landing page, which
+#       torch.hub silently caches as the checkpoint and then explodes later at
+#       `torch.load` time with a cryptic unpickling error.
+#   (2) We want a clear, actionable error message up-front if the URL is wrong
+#       or if the host requires a different client.
 if [[ -z "${DRY_RUN:-}" ]]; then
   echo "Pre-downloading torch.hub ViT checkpoints (MoCo v3, MVP, VC-1)..."
+  CACHE_DIR="$HOME/.cache/torch/hub/checkpoints"
+  mkdir -p "$CACHE_DIR"
+
+  download_and_validate() {
+    local url="$1"
+    local fname
+    fname=$(basename "${url%%\?*}")
+    local fpath="${CACHE_DIR}/${fname}"
+
+    if [[ -f "$fpath" ]]; then
+      if python3 -c "import torch, sys; torch.load(sys.argv[1], map_location='cpu', weights_only=False)" "$fpath" >/dev/null 2>&1; then
+        echo "  ${fname} — cached"
+        return 0
+      else
+        echo "  ${fname} — cached file is corrupted, re-downloading"
+        rm -f "$fpath"
+      fi
+    fi
+
+    echo "  Downloading ${fname} from ${url} ..."
+    # -L follow redirects, -f fail on HTTP error, -sS silent but show errors,
+    # --retry for transient network issues.
+    if ! curl -L -f -sS --retry 3 --retry-delay 2 --connect-timeout 30 -o "${fpath}.part" "$url"; then
+      rm -f "${fpath}.part"
+      echo "ERROR: curl failed to download ${url}" >&2
+      echo "       If this is the MVP checkpoint (Berkeley Box link), the share link" >&2
+      echo "       is rate-limited or redirected. Options:" >&2
+      echo "         1. Open ${url} in a browser, download manually, and place the file at" >&2
+      echo "            ${fpath}" >&2
+      echo "         2. Set MVP_VITS_URL=<mirror-url> and re-run this script." >&2
+      exit 1
+    fi
+
+    # Integrity check: every PyTorch checkpoint we use here is either a pickle
+    # (legacy, starts with 0x80 protocol byte) or a zip archive (modern, starts
+    # with 'PK\x03\x04'). Anything else — especially an HTML page from a redirect
+    # landing — is not a valid checkpoint and must be rejected.
+    local head4
+    head4=$(head -c 4 "${fpath}.part" | od -An -c | tr -d ' \n' || true)
+    # Also require a minimum size sanity check (> 1 MB for even the smallest ViT-S).
+    local size_bytes
+    size_bytes=$(stat -c%s "${fpath}.part" 2>/dev/null || stat -f%z "${fpath}.part")
+    if [[ "$size_bytes" -lt 1048576 ]]; then
+      rm -f "${fpath}.part"
+      echo "ERROR: downloaded file is only ${size_bytes} bytes, far smaller than any" >&2
+      echo "       legitimate ViT checkpoint. The URL likely served an HTML error page." >&2
+      echo "       URL: ${url}" >&2
+      exit 1
+    fi
+
+    # Stronger check: confirm torch.load actually succeeds.
+    if ! python3 -c "import torch, sys; torch.load(sys.argv[1], map_location='cpu', weights_only=False)" "${fpath}.part" >/dev/null 2>&1; then
+      mv "${fpath}.part" "${fpath}.corrupt"
+      echo "ERROR: downloaded file at ${fpath}.corrupt is not a valid PyTorch checkpoint." >&2
+      echo "       File header bytes: ${head4}" >&2
+      echo "       Size: ${size_bytes} bytes" >&2
+      echo "       This is usually an HTML redirect page (Box share link failure)." >&2
+      echo "       URL: ${url}" >&2
+      echo "       Fix: manually download the checkpoint to ${fpath} or set MVP_VITS_URL=<mirror>." >&2
+      exit 1
+    fi
+
+    mv "${fpath}.part" "$fpath"
+    echo "  ${fname} — done (${size_bytes} bytes)"
+  }
+
   for url in "$MOCOV3_VITS_URL" "$MVP_VITS_URL" "$VC1_VITB_URL"; do
-    python3 -c "
-import torch, os
-url = '${url}'
-cache_dir = os.path.expanduser('~/.cache/torch/hub/checkpoints')
-fname = os.path.basename(url.split('?')[0])
-fpath = os.path.join(cache_dir, fname)
-if os.path.exists(fpath):
-    print(f'  {fname} — cached')
-else:
-    print(f'  Downloading {fname}...')
-    torch.hub.load_state_dict_from_url(url, map_location='cpu')
-    print(f'  {fname} — done')
-"
+    download_and_validate "$url"
   done
   echo ""
 
@@ -128,15 +193,36 @@ PYEOF
   echo ""
 fi
 
+# ── EGL device mapping ─────────────────────────────────────────────
+# EGL device ordering does NOT match CUDA device ordering, and setting
+# CUDA_VISIBLE_DEVICES corrupts EGL enumeration. We probe once (cached
+# under .egl_probe/) and use RENDER_GPU_DEVICE_ID + --policy.device instead.
+EGL_PROBE_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/egl_probe.py"
+if [[ -z "${DRY_RUN:-}" ]]; then
+    echo "Loading EGL device mapping..."
+    EGL_MAP_JSON=$(python3 "$EGL_PROBE_SCRIPT")
+    echo "EGL mapping (CUDA GPU -> EGL device): ${EGL_MAP_JSON}"
+    for gpu in "${GPUS[@]}"; do
+        egl_id=$(python3 -c "import json; m=json.loads('${EGL_MAP_JSON}'); print(m.get('${gpu}', '${gpu}'))")
+        export "EGL_MAP_${gpu}=${egl_id}"
+        echo "  CUDA GPU ${gpu} -> EGL device ${egl_id}"
+    done
+    echo ""
+fi
+
 # ── run_task function ──────────────────────────────────────────────
 run_task() {
     local suite="$1" backbone="$2" job_seq="$3"
 
-    # GPU assignment
+    # GPU assignment — do NOT set CUDA_VISIBLE_DEVICES (it corrupts EGL).
+    # Use RENDER_GPU_DEVICE_ID for EGL and --policy.device for PyTorch.
     local num_gpus=${#GPUS[@]}
     local device_idx=$(( (job_seq - 1) % num_gpus ))
     local gpu=${GPUS[$device_idx]}
-    export CUDA_VISIBLE_DEVICES="$gpu"
+    unset CUDA_VISIBLE_DEVICES
+    local egl_var="EGL_MAP_${gpu}"
+    local egl_id="${!egl_var:-$gpu}"
+    export RENDER_GPU_DEVICE_ID="$egl_id"
 
     # Per-suite metadata
     local num_tasks_var="SUITE_NUM_TASKS_${suite}"
@@ -171,6 +257,7 @@ run_task() {
         --dataset.repo_id="$REPO_ID"
         --dataset.episodes="$episodes"
         --policy.type=act
+        --policy.device="cuda:${gpu}"
         --policy.freeze_backbone=true
         --policy.num_tasks="$num_tasks"
         --policy.task_embed_dim=64
@@ -186,7 +273,6 @@ run_task() {
         --eval.batch_size="$EVAL_BATCH"
         --seed="$SEED"
         --policy.optimizer_lr="$LR"
-        --policy.optimizer_lr_backbone="$LR"
         --output_dir="$run_dir"
         --job_name="$run_name"
         --wandb.enable=true
@@ -256,10 +342,10 @@ run_task() {
             ;;
     esac
 
-    echo "[GPU ${gpu}] ${run_name} (act, ${suite}, ${backbone}, ${num_tasks} tasks)"
+    echo "[GPU ${gpu}|EGL ${egl_id}] ${run_name} (act, ${suite}, ${backbone}, ${num_tasks} tasks)"
 
     if [[ -n "${DRY_RUN:-}" ]]; then
-        printf 'CUDA_VISIBLE_DEVICES=%s ' "$gpu"
+        printf 'RENDER_GPU_DEVICE_ID=%s ' "$egl_id"
         printf '%q ' "${cmd[@]}"
         echo
     else
