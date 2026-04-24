@@ -85,7 +85,7 @@ class Dinov2BackboneWrapper(nn.Module):
     and returns {"feature_map": ...} to match the ResNet backbone interface.
     """
 
-    def __init__(self, model_name: str):
+    def __init__(self, model_name: str, image_size: int = 224):
         super().__init__()
         if Dinov2Model is None:
             raise ImportError(
@@ -95,7 +95,7 @@ class Dinov2BackboneWrapper(nn.Module):
         self.vision_model = Dinov2Model.from_pretrained(model_name)
         self.hidden_size = self.vision_model.config.hidden_size
         self.patch_size = self.vision_model.config.patch_size
-        self.image_size = self.vision_model.config.image_size
+        self.image_size = image_size
         self.grid_size = self.image_size // self.patch_size
 
     def forward(self, x: Tensor) -> dict[str, Tensor]:

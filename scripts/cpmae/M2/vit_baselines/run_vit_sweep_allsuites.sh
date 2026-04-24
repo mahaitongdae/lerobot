@@ -197,7 +197,7 @@ fi
 # EGL device ordering does NOT match CUDA device ordering, and setting
 # CUDA_VISIBLE_DEVICES corrupts EGL enumeration. We probe once (cached
 # under .egl_probe/) and use RENDER_GPU_DEVICE_ID + --policy.device instead.
-EGL_PROBE_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/egl_probe.py"
+EGL_PROBE_SCRIPT="scripts/cpmae/egl_probe.py"
 if [[ -z "${DRY_RUN:-}" ]]; then
     echo "Loading EGL device mapping..."
     EGL_MAP_JSON=$(python3 "$EGL_PROBE_SCRIPT" | grep -E '^\{.*\}$' | tail -1)
@@ -292,7 +292,7 @@ run_task() {
     # DINOv2 models are larger and OOM at bs=64; halve batch size and accumulate 2x.
     case "$backbone" in
         dinov2_*)
-            cmd+=(--batch_size=16 --gradient_accumulation_steps=4)
+            cmd+=(--batch_size=64) #  --gradient_accumulation_steps=4
             ;;
     esac
 

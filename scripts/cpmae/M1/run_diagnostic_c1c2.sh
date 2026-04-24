@@ -37,6 +37,7 @@ N_EVAL_EPISODES=20
 EVAL_BATCH=20
 SEED=42
 RESULTS_DIR="results/M1_diagnostic_c1c2"
+RUNNING_DIR="${RESULTS_DIR}/.running"
 REPO_ID="HuggingFaceVLA/libero"
 CONTACT_LABELS_DIR="results/contact_labels"
 SUITE="libero_spatial"
@@ -48,6 +49,7 @@ SSL_URL="https://dl.fbaipublicfiles.com/moco/moco_checkpoints/moco_v2_800ep/moco
 
 mkdir -p "$RESULTS_DIR"
 mkdir -p "${RESULTS_DIR}/logs"
+mkdir -p "$RUNNING_DIR"
 
 # Ensure task_mapping.json exists
 if [[ ! -f "$MAPPING_JSON" ]]; then
@@ -94,7 +96,7 @@ fi
 # EGL device ordering does NOT match CUDA device ordering, and setting
 # CUDA_VISIBLE_DEVICES corrupts EGL enumeration. We probe once (cached
 # under .egl_probe/) and use RENDER_GPU_DEVICE_ID + --policy.device instead.
-EGL_PROBE_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/egl_probe.py"
+EGL_PROBE_SCRIPT="scripts/cpmae/egl_probe.py"
 if [[ -z "${DRY_RUN:-}" ]]; then
     echo "Loading EGL device mapping..."
     EGL_MAP_JSON=$(python3 "$EGL_PROBE_SCRIPT" | grep -E '^\{.*\}$' | tail -1)
@@ -154,6 +156,17 @@ run_task() {
 
   local run_name="${run_id}_${policy}_${degrade}"
   local run_dir="${RESULTS_DIR}/${run_name}"
+
+  # Track running jobs via marker files; print queue on start/finish
+  local marker="${RUNNING_DIR}/${run_name}"
+  _print_running() {
+    local jobs
+    jobs=$(ls "$RUNNING_DIR" 2>/dev/null | tr '\n' '  ' | sed 's/  $//')
+    echo "[running] ${jobs:-<none>}"
+  }
+  touch "$marker"
+  trap 'rm -f "$marker"; _print_running' EXIT
+  _print_running
 
   # Checkpoint skip / resume
   local resume_flag=""
@@ -248,7 +261,7 @@ export -f run_task
 
 export GPUS REPO_ID RESULTS_DIR STEPS EVAL_FREQ SAVE_FREQ
 export N_EVAL_EPISODES EVAL_BATCH BATCH_SIZE LR NUM_WORKERS SEED
-export SSL_URL SUITE CONTACT_LABELS_DIR
+export SSL_URL SUITE CONTACT_LABELS_DIR RUNNING_DIR
 export ALL_EPISODES NUM_TASKS TASK_INDEX_OFFSET ENV_TASK_IDS
 
 # ── Launch ─────────────────────────────────────────────────────────

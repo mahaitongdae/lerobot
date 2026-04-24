@@ -86,7 +86,7 @@ run_experiment() {
   echo "[GPU ${gpu}] ${run_name} (mode=${mode}, ${extra})"
 
   local cmd=(
-    python3 scripts/cpmae/pretrain_mae.py
+    python3 -u scripts/cpmae/pretrain_mae.py
     --mode="$mode"
     --output_dir="$run_dir"
     --epochs="$EPOCHS"
@@ -95,6 +95,7 @@ run_experiment() {
     --contact_mask_ratio="$CONTACT_MASK_RATIO"
     --transit_mask_ratio="$TRANSIT_MASK_RATIO"
     --contact_labels_dir="$CONTACT_LABELS_DIR"
+    --num_workers="${NUM_WORKERS:-2}"
     --gpu=0
   )
 
@@ -109,7 +110,7 @@ run_experiment() {
     return 0
   fi
 
-  CUDA_VISIBLE_DEVICES="$gpu" "${cmd[@]}" 2>&1 | tee "${RESULTS_DIR}/logs/${run_name}.log"
+  PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES="$gpu" "${cmd[@]}" 2>&1 | tee "${RESULTS_DIR}/logs/${run_name}.log"
 }
 
 # ── Dispatch: launch up to NUM_GPUS experiments in parallel ─────────
