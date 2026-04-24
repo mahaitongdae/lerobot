@@ -378,14 +378,14 @@ echo ""
 
 if [[ -n "${DRY_RUN:-}" ]]; then
     env_parallel -P "${PARALLEL}" \
-        run_task {1} {2} {#} \
+        run_task {1} {2} {%} \
         ::: "${SUITES[@]}" \
         ::: "${BACKBONES[@]}"
 else
     env_parallel --bar \
         --results "${RESULTS_DIR}/logs" \
         -P "${PARALLEL}" \
-        run_task {1} {2} {#} \
+        run_task {1} {2} {%} \
         ::: "${SUITES[@]}" \
         ::: "${BACKBONES[@]}"
 fi
