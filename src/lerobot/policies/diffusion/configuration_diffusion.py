@@ -127,6 +127,23 @@ class DiffusionConfig(PreTrainedConfig):
     # Supports MoCo v1/v2/v3, SimCLR, BYOL, VISSL, and solo-learn formats.
     # Requires use_group_norm=False to preserve BatchNorm weights from SSL pretraining.
     ssl_checkpoint_path: str | None = None
+    # SigLIP backbone (used when vision_backbone starts with "siglip").
+    siglip_model_name: str | None = None
+    # DINOv2 backbone (used when vision_backbone starts with "dinov2").
+    dinov2_model_name: str | None = None
+    # MoCo v3 ViT backbone (used when vision_backbone starts with "mocov3").
+    mocov3_checkpoint_path: str | None = None
+    mocov3_arch: str = "vit_small"
+    # Voltron backbone (used when vision_backbone starts with "voltron").
+    voltron_model_id: str = "v-cond"
+    voltron_cache_dir: str | None = None
+    # CP-MAE backbone (used when vision_backbone starts with "cpmae").
+    cpmae_checkpoint_path: str | None = None
+    cpmae_img_size: int = 224
+    cpmae_patch_size: int = 16
+    cpmae_embed_dim: int = 384
+    cpmae_depth: int = 12
+    cpmae_n_heads: int = 6
     use_group_norm: bool = True
     # Per-backbone pretraining input normalization applied inside the model, AFTER any
     # dataset-statistic normalization. Use this to match the pixel statistics the backbone
@@ -179,16 +196,80 @@ class DiffusionConfig(PreTrainedConfig):
         super().__post_init__()
 
         """Input validation (not exhaustive)."""
-        if not self.vision_backbone.startswith("resnet"):
+        supported_prefixes = ("resnet", "siglip", "dinov2", "mocov3", "voltron", "cpmae")
+        if not any(self.vision_backbone.startswith(p) for p in supported_prefixes):
             raise ValueError(
-                f"`vision_backbone` must be one of the ResNet variants. Got {self.vision_backbone}."
+                f"`vision_backbone` must start with one of {supported_prefixes}. "
+                f"Got {self.vision_backbone}."
             )
 
+        is_resnet = self.vision_backbone.startswith("resnet")
+
+        # Auto-disable ResNet-specific options for ViT backbones.
+        if not is_resnet:
+            if self.use_group_norm:
+                _logger.warning(
+                    "use_group_norm=True is ResNet-specific; forcing to False for %s backbone.",
+                    self.vision_backbone,
+                )
+                self.use_group_norm = False
+            if self.crop_shape is not None:
+                _logger.warning(
+                    "crop_shape=%r is designed for ResNet; forcing to None for %s backbone "
+                    "(ViT wrappers handle their own resizing).",
+                    self.crop_shape, self.vision_backbone,
+                )
+                self.crop_shape = None
+            if self.pretrained_backbone_weights is not None:
+                _logger.warning(
+                    "pretrained_backbone_weights=%r is ignored for non-ResNet backbones; "
+                    "forcing to None for %s backbone.",
+                    self.pretrained_backbone_weights, self.vision_backbone,
+                )
+                self.pretrained_backbone_weights = None
+
         if self.ssl_checkpoint_path is not None:
+            if not is_resnet:
+                raise ValueError(
+                    "`ssl_checkpoint_path` is only supported for ResNet backbones. "
+                    f"Got vision_backbone={self.vision_backbone!r}."
+                )
             if self.pretrained_backbone_weights is not None:
                 self.pretrained_backbone_weights = None
             if self.use_group_norm:
                 self.use_group_norm = False
+
+        # Required-field checks for ViT backbones.
+        if self.vision_backbone.startswith("siglip") and not self.siglip_model_name:
+            raise ValueError(
+                "`siglip_model_name` must be set when using a SigLIP vision backbone "
+                "(e.g. 'google/siglip-base-patch16-224')."
+            )
+        if self.vision_backbone.startswith("dinov2") and not self.dinov2_model_name:
+            raise ValueError(
+                "`dinov2_model_name` must be set when using a DINOv2 vision backbone "
+                "(e.g. 'facebook/dinov2-small')."
+            )
+        if self.vision_backbone.startswith("mocov3") and not self.mocov3_checkpoint_path:
+            raise ValueError(
+                "`mocov3_checkpoint_path` must be set when using a MoCo v3 vision backbone "
+                "(e.g. 'https://dl.fbaipublicfiles.com/moco-v3/vit-s-300ep/vit-s-300ep.pth.tar')."
+            )
+        if self.vision_backbone.startswith("voltron") and not self.voltron_model_id:
+            raise ValueError(
+                "`voltron_model_id` must be set when using a Voltron vision backbone "
+                "(e.g. 'v-cond' or 'v-cond-base')."
+            )
+        if self.vision_backbone.startswith("cpmae") and not self.cpmae_checkpoint_path:
+            raise ValueError(
+                "`cpmae_checkpoint_path` must be set when using a CP-MAE vision backbone "
+                "(e.g. 'results/M3_cpmae/R200_cpmae/encoder_final.pt')."
+            )
+        if self.vision_backbone.startswith("cpmae") and self.cpmae_img_size % self.cpmae_patch_size != 0:
+            raise ValueError(
+                f"`cpmae_img_size` ({self.cpmae_img_size}) must be divisible by "
+                f"`cpmae_patch_size` ({self.cpmae_patch_size})."
+            )
 
         # Validate the backbone input-normalization preset and auto-disable the pipeline
         # VISUAL normalization when a pretraining preset is selected, to avoid applying
