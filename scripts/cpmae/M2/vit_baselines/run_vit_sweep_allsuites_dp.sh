@@ -36,7 +36,7 @@ PARALLEL=$((NUM_EACH_GPU * ${#GPUS[@]}))
 # ── Hyperparameters (fixed) ────────────────────────────────────────
 STEPS=100000
 EVAL_FREQ=25000
-SAVE_FREQ=100000
+SAVE_FREQ=25000
 N_EVAL_EPISODES=20
 EVAL_BATCH=20
 BATCH_SIZE=64
@@ -56,8 +56,8 @@ VC1_VITB_URL="${VC1_VITB_URL:-https://dl.fbaipublicfiles.com/eai-vc/vc1_vitb.pth
 VOLTRON_CACHE_DIR="${VOLTRON_CACHE_DIR:-$HOME/.voltron}"
 
 # ── Suite & backbone lists ────────────────────────────────────────
-SUITES=(libero_10)  #  libero_spatial libero_object libero_goal
-BACKBONES=(dinov2_vits mocov3_vits vc1_vitb voltron_vcond) # dinov2_vits dinov2_vitb siglip_vitb  mvp_vits
+SUITES=(libero_10 libero_spatial libero_object libero_goal)  #  libero_spatial libero_object libero_goal
+BACKBONES=(dinov2_vits mocov3_vits vc1_vitb voltron_vcond siglip_vitb  mvp_vits) # dinov2_vits dinov2_vitb siglip_vitb  mvp_vits
 
 MAPPING_JSON="scripts/cpmae/task_mapping.json"
 
@@ -215,7 +215,8 @@ run_task() {
     local run_name="ViT_dp_${suite}_${backbone}"
     local run_dir="${RESULTS_DIR}/${run_name}"
 
-    # Checkpoint skip
+    # Checkpoint skip / resume
+    local do_resume=false
     local step_file="${run_dir}/checkpoints/last/training_state/training_step.json"
     if [[ -f "$step_file" ]]; then
         local saved_step
@@ -225,102 +226,117 @@ run_task() {
             return 0
         else
             echo "[GPU ${gpu}] ${run_name} — resuming from step ${saved_step}"
+            do_resume=true
         fi
+    elif [[ -d "$run_dir" ]]; then
+        echo "[GPU ${gpu}] ${run_name} — output dir exists but no checkpoint; skipping."
+        echo "  To retry, manually remove: rm -rf ${run_dir}"
+        return 0
     fi
 
     # ── Build command ─────────────────────────────────────────────
-    local cmd=(
-        lerobot-train
-        --dataset.repo_id="$REPO_ID"
-        --dataset.episodes="$episodes"
-        --policy.type=diffusion
-        --policy.device="cuda:${gpu}"
-        --policy.freeze_backbone=true
-        --policy.num_tasks="$num_tasks"
-        --policy.task_embed_dim=64
-        --policy.task_index_offset="$task_index_offset"
-        --env.type=libero
-        --env.task="$suite"
-        --env.task_ids="$env_task_ids"
-        --batch_size="$BATCH_SIZE"
-        --steps="$STEPS"
-        --eval_freq="$EVAL_FREQ"
-        --save_freq="$SAVE_FREQ"
-        --eval.n_episodes="$N_EVAL_EPISODES"
-        --eval.batch_size="$EVAL_BATCH"
-        --seed="$SEED"
-        --policy.optimizer_lr="$LR"
-        --output_dir="$run_dir"
-        --job_name="$run_name"
-        --wandb.enable=true
-        --wandb.project=cpmae_vit_sweep_dp
-        --policy.push_to_hub=false
-    )
+    local cmd=(lerobot-train)
 
-    # Per-backbone pretraining input normalization.
-    local norm_preset="imagenet"
-    case "$backbone" in
-        siglip_*) norm_preset="siglip" ;;
-        cpmae_*)  norm_preset="identity" ;;
-    esac
-    cmd+=(--policy.backbone_input_norm="$norm_preset")
+    if $do_resume; then
+        local config_path="${run_dir}/checkpoints/last/pretrained_model/train_config.json"
+        cmd+=(
+            --resume=true
+            --config_path="$config_path"
+            --policy.device="cuda:${gpu}"
+        )
+    else
+        cmd+=(
+            --dataset.repo_id="$REPO_ID"
+            --dataset.episodes="$episodes"
+            --policy.type=diffusion
+            --policy.device="cuda:${gpu}"
+            --policy.freeze_backbone=true
+            --policy.num_tasks="$num_tasks"
+            --policy.task_embed_dim=64
+            --policy.task_index_offset="$task_index_offset"
+            --env.type=libero
+            --env.task="$suite"
+            --env.task_ids="$env_task_ids"
+            --batch_size="$BATCH_SIZE"
+            --steps="$STEPS"
+            --eval_freq="$EVAL_FREQ"
+            --save_freq="$SAVE_FREQ"
+            --eval.n_episodes="$N_EVAL_EPISODES"
+            --eval.batch_size="$EVAL_BATCH"
+            --seed="$SEED"
+            --policy.optimizer_lr="$LR"
+            --output_dir="$run_dir"
+            --job_name="$run_name"
+            --wandb.enable=true
+            --wandb.project=cpmae_vit_sweep_dp
+            --policy.push_to_hub=false
+        )
 
-    # DINOv2 models are larger and OOM at bs=64; halve batch size and accumulate 2x.
-    case "$backbone" in
-        dinov2_*)
-            cmd+=(--batch_size=64) #  --gradient_accumulation_steps=4
-            ;;
-    esac
+        # Per-backbone pretraining input normalization.
+        local norm_preset="imagenet"
+        case "$backbone" in
+            siglip_*) norm_preset="siglip" ;;
+            cpmae_*)  norm_preset="identity" ;;
+        esac
+        cmd+=(--policy.backbone_input_norm="$norm_preset")
 
-    # Add backbone-specific flags
-    case "$backbone" in
-        dinov2_vits)
-            cmd+=(
-                --policy.vision_backbone=dinov2
-                --policy.dinov2_model_name=facebook/dinov2-small
-            )
-            ;;
-        dinov2_vitb)
-            cmd+=(
-                --policy.vision_backbone=dinov2
-                --policy.dinov2_model_name=facebook/dinov2-base
-            )
-            ;;
-        siglip_vitb)
-            cmd+=(
-                --policy.vision_backbone=siglip
-                --policy.siglip_model_name=google/siglip-base-patch16-224
-            )
-            ;;
-        mocov3_vits)
-            cmd+=(
-                --policy.vision_backbone=mocov3
-                --policy.mocov3_checkpoint_path="$MOCOV3_VITS_URL"
-                --policy.mocov3_arch=vit_small
-            )
-            ;;
-        mvp_vits)
-            cmd+=(
-                --policy.vision_backbone=mocov3
-                --policy.mocov3_checkpoint_path="$MVP_VITS_URL"
-                --policy.mocov3_arch=vit_small
-            )
-            ;;
-        vc1_vitb)
-            cmd+=(
-                --policy.vision_backbone=mocov3
-                --policy.mocov3_checkpoint_path="$VC1_VITB_URL"
-                --policy.mocov3_arch=vit_base
-            )
-            ;;
-        voltron_vcond)
-            cmd+=(
-                --policy.vision_backbone=voltron
-                --policy.voltron_model_id=v-cond
-                --policy.voltron_cache_dir="$VOLTRON_CACHE_DIR"
-            )
-            ;;
-    esac
+        # DINOv2 models are larger and OOM at bs=64; halve batch size and accumulate 2x.
+        case "$backbone" in
+            dinov2_*)
+                cmd+=(--batch_size=64) #  --gradient_accumulation_steps=4
+                ;;
+        esac
+
+        # Add backbone-specific flags
+        case "$backbone" in
+            dinov2_vits)
+                cmd+=(
+                    --policy.vision_backbone=dinov2
+                    --policy.dinov2_model_name=facebook/dinov2-small
+                )
+                ;;
+            dinov2_vitb)
+                cmd+=(
+                    --policy.vision_backbone=dinov2
+                    --policy.dinov2_model_name=facebook/dinov2-base
+                )
+                ;;
+            siglip_vitb)
+                cmd+=(
+                    --policy.vision_backbone=siglip
+                    --policy.siglip_model_name=google/siglip-base-patch16-224
+                )
+                ;;
+            mocov3_vits)
+                cmd+=(
+                    --policy.vision_backbone=mocov3
+                    --policy.mocov3_checkpoint_path="$MOCOV3_VITS_URL"
+                    --policy.mocov3_arch=vit_small
+                )
+                ;;
+            mvp_vits)
+                cmd+=(
+                    --policy.vision_backbone=mocov3
+                    --policy.mocov3_checkpoint_path="$MVP_VITS_URL"
+                    --policy.mocov3_arch=vit_small
+                )
+                ;;
+            vc1_vitb)
+                cmd+=(
+                    --policy.vision_backbone=mocov3
+                    --policy.mocov3_checkpoint_path="$VC1_VITB_URL"
+                    --policy.mocov3_arch=vit_base
+                )
+                ;;
+            voltron_vcond)
+                cmd+=(
+                    --policy.vision_backbone=voltron
+                    --policy.voltron_model_id=v-cond
+                    --policy.voltron_cache_dir="$VOLTRON_CACHE_DIR"
+                )
+                ;;
+        esac
+    fi
 
     echo "[GPU ${gpu}|EGL ${egl_id}] ${run_name} (diffusion, ${suite}, ${backbone}, ${num_tasks} tasks)"
 

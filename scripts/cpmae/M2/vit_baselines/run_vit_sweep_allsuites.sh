@@ -60,8 +60,8 @@ VC1_VITB_URL="${VC1_VITB_URL:-https://dl.fbaipublicfiles.com/eai-vc/vc1_vitb.pth
 VOLTRON_CACHE_DIR="${VOLTRON_CACHE_DIR:-$HOME/.voltron}"
 
 # ── Suite & backbone lists ────────────────────────────────────────
-SUITES=(libero_10)  #  libero_spatial libero_object libero_goal
-BACKBONES=(dinov2_vits mocov3_vits vc1_vitb voltron_vcond) # dinov2_vits dinov2_vitb siglip_vitb  mvp_vits
+SUITES=(libero_10 libero_spatial libero_object libero_goal)  #  libero_spatial libero_object libero_goal
+BACKBONES=(dinov2_vits dinov2_vitb mocov3_vits vc1_vitb voltron_vcond siglip_vitb) # dinov2_vits dinov2_vitb siglip_vitb  mvp_vits
 
 MAPPING_JSON="scripts/cpmae/task_mapping.json"
 
