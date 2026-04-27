@@ -33,6 +33,8 @@ from diffusers.schedulers.scheduling_ddim import DDIMScheduler
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 from torch import Tensor, nn
 
+import copy
+
 from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.utils.backbone_input_norm import BackboneInputNormalizer
@@ -173,6 +175,47 @@ def _make_noise_scheduler(name: str, **kwargs: dict) -> DDPMScheduler | DDIMSche
         raise ValueError(f"Unsupported noise scheduler type {name}")
 
 
+def _make_per_camera_config(config: DiffusionConfig, cam_key: str) -> DiffusionConfig:
+    """Return config for *cam_key*, applying per_camera_backbone overrides if any."""
+    if not config.per_camera_backbone or cam_key not in config.per_camera_backbone:
+        return config
+
+    cfg = copy.copy(config)
+    cfg.vision_backbone = config.per_camera_backbone[cam_key]
+
+    _PCB = config.per_camera_backbone_norm or {}
+    cfg.backbone_input_norm = _PCB.get(cam_key, "identity")
+
+    _FIELDS: list[tuple[str, str, object]] = [
+        ("per_camera_siglip_model_name", "siglip_model_name", None),
+        ("per_camera_dinov2_model_name", "dinov2_model_name", None),
+        ("per_camera_mocov3_checkpoint_path", "mocov3_checkpoint_path", None),
+        ("per_camera_mocov3_arch", "mocov3_arch", "vit_small"),
+        ("per_camera_voltron_model_id", "voltron_model_id", "v-cond"),
+        ("per_camera_voltron_cache_dir", "voltron_cache_dir", None),
+        ("per_camera_cpmae_checkpoint_path", "cpmae_checkpoint_path", None),
+        ("per_camera_cpmae_embed_dim", "cpmae_embed_dim", 384),
+        ("per_camera_cpmae_n_heads", "cpmae_n_heads", 6),
+    ]
+    for dict_attr, scalar_attr, default in _FIELDS:
+        per_cam_dict = getattr(config, dict_attr, None) or {}
+        setattr(cfg, scalar_attr, per_cam_dict.get(cam_key, default))
+
+    is_resnet = cfg.vision_backbone.startswith("resnet")
+    if not is_resnet:
+        cfg.use_group_norm = False
+        cfg.crop_shape = None
+        cfg.pretrained_backbone_weights = None
+    else:
+        # Restore ResNet defaults that __post_init__ may have stripped
+        # when the global backbone is a ViT.
+        if cfg.crop_shape is None:
+            cfg.crop_shape = (84, 84)
+        cfg.use_group_norm = True
+
+    return cfg
+
+
 class DiffusionModel(nn.Module):
     def __init__(self, config: DiffusionConfig):
         super().__init__()
@@ -183,9 +226,13 @@ class DiffusionModel(nn.Module):
         if self.config.image_features:
             num_images = len(self.config.image_features)
             if self.config.use_separate_rgb_encoder_per_camera:
-                encoders = [DiffusionRgbEncoder(config) for _ in range(num_images)]
+                encoders = []
+                cam_keys = list(self.config.image_features.keys())
+                for cam_key in cam_keys:
+                    cam_config = _make_per_camera_config(config, cam_key)
+                    encoders.append(DiffusionRgbEncoder(cam_config))
                 self.rgb_encoder = nn.ModuleList(encoders)
-                global_cond_dim += encoders[0].feature_dim * num_images
+                global_cond_dim += sum(enc.feature_dim for enc in encoders)
             else:
                 self.rgb_encoder = DiffusionRgbEncoder(config)
                 global_cond_dim += self.rgb_encoder.feature_dim * num_images

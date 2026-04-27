@@ -157,6 +157,22 @@ class DiffusionConfig(PreTrainedConfig):
     freeze_backbone: bool = False
     spatial_softmax_num_keypoints: int = 32
     use_separate_rgb_encoder_per_camera: bool = False
+    # Per-camera heterogeneous backbone: assign a different vision backbone to a
+    # specific camera key (e.g. the wrist camera).  When set, the policy
+    # automatically enables use_separate_rgb_encoder_per_camera=True and builds
+    # the specified camera's encoder with a different backbone than the default.
+    # The key must match an entry in input_features (e.g. "observation.images.image2").
+    per_camera_backbone: dict[str, str] | None = None
+    per_camera_backbone_norm: dict[str, str] | None = None
+    per_camera_siglip_model_name: dict[str, str] | None = None
+    per_camera_dinov2_model_name: dict[str, str] | None = None
+    per_camera_mocov3_checkpoint_path: dict[str, str] | None = None
+    per_camera_mocov3_arch: dict[str, str] | None = None
+    per_camera_voltron_model_id: dict[str, str] | None = None
+    per_camera_voltron_cache_dir: dict[str, str] | None = None
+    per_camera_cpmae_checkpoint_path: dict[str, str] | None = None
+    per_camera_cpmae_embed_dim: dict[str, int] | None = None
+    per_camera_cpmae_n_heads: dict[str, int] | None = None
     # Unet.
     down_dims: tuple[int, ...] = (512, 1024, 2048)
     kernel_size: int = 5
@@ -293,6 +309,20 @@ class DiffusionConfig(PreTrainedConfig):
                 )
                 self.normalization_mapping["VISUAL"] = NormalizationMode.IDENTITY
 
+        # Per-camera heterogeneous backbone: auto-enable separate encoders.
+        if self.per_camera_backbone:
+            if not self.use_separate_rgb_encoder_per_camera:
+                _logger.info(
+                    "per_camera_backbone is set; auto-enabling use_separate_rgb_encoder_per_camera=True."
+                )
+                self.use_separate_rgb_encoder_per_camera = True
+            for cam_key, bb in self.per_camera_backbone.items():
+                if not any(bb.startswith(p) for p in supported_prefixes):
+                    raise ValueError(
+                        f"per_camera_backbone['{cam_key}'] must start with one of {supported_prefixes}. "
+                        f"Got {bb!r}."
+                    )
+
         supported_prediction_types = ["epsilon", "sample"]
         if self.prediction_type not in supported_prediction_types:
             raise ValueError(
@@ -348,6 +378,16 @@ class DiffusionConfig(PreTrainedConfig):
                 if image_ft.shape != first_image_ft.shape:
                     raise ValueError(
                         f"`{key}` does not match `{first_image_key}`, but we expect all image shapes to match."
+                    )
+
+        # Validate per-camera backbone keys match actual image features.
+        if self.per_camera_backbone:
+            valid_cam_keys = set(self.image_features.keys())
+            for cam_key in self.per_camera_backbone:
+                if cam_key not in valid_cam_keys:
+                    raise ValueError(
+                        f"per_camera_backbone key '{cam_key}' does not match any image feature. "
+                        f"Available camera keys: {sorted(valid_cam_keys)}"
                     )
 
     @property

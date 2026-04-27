@@ -55,9 +55,21 @@ VC1_VITB_URL="${VC1_VITB_URL:-https://dl.fbaipublicfiles.com/eai-vc/vc1_vitb.pth
 # Voltron cache directory (the voltron-robotics package downloads to `cache/` by default)
 VOLTRON_CACHE_DIR="${VOLTRON_CACHE_DIR:-$HOME/.voltron}"
 
+# ── CP-MAE pretrained encoder checkpoints ─────────────────────────
+CPMAE_R200_CKPT="${CPMAE_R200_CKPT:-results/M3_cpmae/R200_cpmae/encoder_best.pt}"
+CPMAE_R201_CKPT="${CPMAE_R201_CKPT:-results/M3_cpmae/R201_uniform_mae/encoder_best.pt}"
+CPMAE_R300_CKPT="${CPMAE_R300_CKPT:-results/M3_cpmae_improved/R300_cpmae/encoder_best.pt}"
+CPMAE_R301_CKPT="${CPMAE_R301_CKPT:-results/M3_cpmae_improved/R301_cpmae/encoder_best.pt}"
+CPMAE_R302_CKPT="${CPMAE_R302_CKPT:-results/M3_cpmae_improved/R302_cpmae/encoder_best.pt}"
+CPMAE_R303_CKPT="${CPMAE_R303_CKPT:-results/M3_cpmae_improved/R303_hybrid/encoder_best.pt}"
+
 # ── Suite & backbone lists ────────────────────────────────────────
 SUITES=(libero_10 libero_spatial libero_object libero_goal)  #  libero_spatial libero_object libero_goal
-BACKBONES=(dinov2_vits mocov3_vits vc1_vitb voltron_vcond siglip_vitb  mvp_vits) # dinov2_vits dinov2_vitb siglip_vitb  mvp_vits
+if [[ -n "${BACKBONES_OVERRIDE:-}" ]]; then
+  read -ra BACKBONES <<< "$BACKBONES_OVERRIDE"
+else
+  BACKBONES=(dinov2_vits mocov3_vits vc1_vitb voltron_vcond siglip_vitb mvp_vits cpmae_R200 cpmae_R201_umae cpmae_R300 cpmae_R301 cpmae_R302_vitb cpmae_R303_hybrid)
+fi
 
 MAPPING_JSON="scripts/cpmae/task_mapping.json"
 
@@ -335,6 +347,54 @@ run_task() {
                     --policy.voltron_cache_dir="$VOLTRON_CACHE_DIR"
                 )
                 ;;
+            cpmae_R200)
+                cmd+=(
+                    --policy.vision_backbone=cpmae
+                    --policy.cpmae_checkpoint_path="$CPMAE_R200_CKPT"
+                    --policy.cpmae_embed_dim=384
+                    --policy.cpmae_n_heads=6
+                )
+                ;;
+            cpmae_R201_umae)
+                cmd+=(
+                    --policy.vision_backbone=cpmae
+                    --policy.cpmae_checkpoint_path="$CPMAE_R201_CKPT"
+                    --policy.cpmae_embed_dim=384
+                    --policy.cpmae_n_heads=6
+                )
+                ;;
+            cpmae_R300)
+                cmd+=(
+                    --policy.vision_backbone=cpmae
+                    --policy.cpmae_checkpoint_path="$CPMAE_R300_CKPT"
+                    --policy.cpmae_embed_dim=384
+                    --policy.cpmae_n_heads=6
+                )
+                ;;
+            cpmae_R301)
+                cmd+=(
+                    --policy.vision_backbone=cpmae
+                    --policy.cpmae_checkpoint_path="$CPMAE_R301_CKPT"
+                    --policy.cpmae_embed_dim=384
+                    --policy.cpmae_n_heads=6
+                )
+                ;;
+            cpmae_R302_vitb)
+                cmd+=(
+                    --policy.vision_backbone=cpmae
+                    --policy.cpmae_checkpoint_path="$CPMAE_R302_CKPT"
+                    --policy.cpmae_embed_dim=768
+                    --policy.cpmae_n_heads=12
+                )
+                ;;
+            cpmae_R303_hybrid)
+                cmd+=(
+                    --policy.vision_backbone=cpmae
+                    --policy.cpmae_checkpoint_path="$CPMAE_R303_CKPT"
+                    --policy.cpmae_embed_dim=384
+                    --policy.cpmae_n_heads=6
+                )
+                ;;
         esac
     fi
 
@@ -353,6 +413,7 @@ export -f run_task
 export GPUS REPO_ID RESULTS_DIR STEPS EVAL_FREQ SAVE_FREQ
 export N_EVAL_EPISODES EVAL_BATCH BATCH_SIZE LR SEED
 export MOCOV3_VITS_URL MVP_VITS_URL VC1_VITB_URL VOLTRON_CACHE_DIR
+export CPMAE_R200_CKPT CPMAE_R201_CKPT CPMAE_R300_CKPT CPMAE_R301_CKPT CPMAE_R302_CKPT CPMAE_R303_CKPT
 
 # ── Launch ─────────────────────────────────────────────────────────
 TOTAL_JOBS=$(( ${#SUITES[@]} * ${#BACKBONES[@]} ))
