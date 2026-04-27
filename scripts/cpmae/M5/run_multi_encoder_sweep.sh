@@ -64,7 +64,7 @@ SUITES=(libero_10 libero_spatial libero_object libero_goal)
 if [[ -n "${BACKBONES_OVERRIDE:-}" ]]; then
   read -ra WRIST_BACKBONES <<< "$BACKBONES_OVERRIDE"
 else
-  WRIST_BACKBONES=(siglip_vitb voltron_vcond vc1_vitb cpmae_R301 mocov3_vits)
+  WRIST_BACKBONES=(voltron_vcond vc1_vitb cpmae_R301 mocov3_vits)
 fi
 
 MAPPING_JSON="scripts/cpmae/task_mapping.json"
@@ -95,74 +95,7 @@ echo ""
 
 # ── Pre-download checkpoints ──────────────────────────────────────
 if [[ -z "${DRY_RUN:-}" ]]; then
-  echo "Pre-downloading model checkpoints..."
-  CACHE_DIR="$HOME/.cache/torch/hub/checkpoints"
-  mkdir -p "$CACHE_DIR"
-
-  download_and_validate() {
-    local url="$1"
-    local fname
-    fname=$(basename "${url%%\?*}")
-    local fpath="${CACHE_DIR}/${fname}"
-
-    if [[ -f "$fpath" ]]; then
-      if python3 -c "import torch, sys; torch.load(sys.argv[1], map_location='cpu', weights_only=False)" "$fpath" >/dev/null 2>&1; then
-        echo "  ${fname} — cached"
-        return 0
-      else
-        echo "  ${fname} — cached file is corrupted, re-downloading"
-        rm -f "$fpath"
-      fi
-    fi
-
-    echo "  Downloading ${fname} from ${url} ..."
-    if ! curl -L -f -sS --retry 3 --retry-delay 2 --connect-timeout 30 -o "${fpath}.part" "$url"; then
-      rm -f "${fpath}.part"
-      echo "ERROR: curl failed to download ${url}" >&2
-      exit 1
-    fi
-
-    local size_bytes
-    size_bytes=$(stat -c%s "${fpath}.part" 2>/dev/null || stat -f%z "${fpath}.part")
-    if [[ "$size_bytes" -lt 1048576 ]]; then
-      rm -f "${fpath}.part"
-      echo "ERROR: downloaded file is only ${size_bytes} bytes." >&2
-      exit 1
-    fi
-
-    if ! python3 -c "import torch, sys; torch.load(sys.argv[1], map_location='cpu', weights_only=False)" "${fpath}.part" >/dev/null 2>&1; then
-      mv "${fpath}.part" "${fpath}.corrupt"
-      echo "ERROR: downloaded file is not a valid checkpoint." >&2
-      exit 1
-    fi
-
-    mv "${fpath}.part" "$fpath"
-    echo "  ${fname} — done (${size_bytes} bytes)"
-  }
-
-  for url in "$MOCOV3_VITS_URL" "$VC1_VITB_URL"; do
-    download_and_validate "$url"
-  done
-
-  echo "Pre-downloading HuggingFace models (DINOv2, SigLIP)..."
-  python3 -c "
-from transformers import Dinov2Model, SiglipVisionModel
-for name in ['facebook/dinov2-small']:
-    print(f'  Loading {name}...')
-    Dinov2Model.from_pretrained(name)
-    print(f'  {name} — cached')
-print(f'  Loading google/siglip-base-patch16-224...')
-SiglipVisionModel.from_pretrained('google/siglip-base-patch16-224')
-print(f'  google/siglip-base-patch16-224 — cached')
-"
-
-  echo "Pre-downloading Voltron V-Cond checkpoint..."
-  mkdir -p "$VOLTRON_CACHE_DIR"
-  python3 - <<PYEOF || { echo "  ERROR: failed to pre-download Voltron. Install: pip install voltron-robotics" >&2; exit 1; }
-import voltron
-model, _ = voltron.load('v-cond', freeze=True, cache='${VOLTRON_CACHE_DIR}')
-print(f'  Voltron v-cond — cached at ${VOLTRON_CACHE_DIR}/v-cond/')
-PYEOF
+  source "$(dirname "${BASH_SOURCE[0]}")/../pre_download_checkpoints.sh"
   echo ""
 fi
 
