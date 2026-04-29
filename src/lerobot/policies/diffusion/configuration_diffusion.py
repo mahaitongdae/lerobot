@@ -144,6 +144,19 @@ class DiffusionConfig(PreTrainedConfig):
     cpmae_embed_dim: int = 384
     cpmae_depth: int = 12
     cpmae_n_heads: int = 6
+    # SD3/SDXL/FLUX VAE backbone (used when vision_backbone starts with "sd3vae").
+    sd3vae_model_name: str = "stabilityai/stable-diffusion-3-medium-diffusers"
+    sd3vae_subfolder: str = "vae"
+    # WAN 2.1/2.2 VAE backbone (used when vision_backbone starts with "wanvae").
+    wanvae_model_name: str = "Wan-AI/Wan2.1-T2V-14B-Diffusers"
+    wanvae_subfolder: str = "vae"
+    # Trainable 1x1 projection dim for generation VAE latents (sd3vae/wanvae).
+    # Expands thin latent channels (16) to a richer representation. None disables.
+    vae_latent_proj_dim: int | None = 256
+    # Sub-batch size for the frozen VAE encoder forward pass. The full effective
+    # batch (batch_size × n_obs_steps × n_cameras) is chunked to this size to
+    # bound peak VRAM from convolutional activation maps.
+    vae_encode_batch_size: int = 64
     use_group_norm: bool = True
     # Per-backbone pretraining input normalization applied inside the model, AFTER any
     # dataset-statistic normalization. Use this to match the pixel statistics the backbone
@@ -212,7 +225,7 @@ class DiffusionConfig(PreTrainedConfig):
         super().__post_init__()
 
         """Input validation (not exhaustive)."""
-        supported_prefixes = ("resnet", "siglip", "dinov2", "mocov3", "voltron", "cpmae")
+        supported_prefixes = ("resnet", "siglip", "dinov2", "mocov3", "voltron", "cpmae", "sd3vae", "wanvae")
         if not any(self.vision_backbone.startswith(p) for p in supported_prefixes):
             raise ValueError(
                 f"`vision_backbone` must start with one of {supported_prefixes}. "
@@ -220,6 +233,7 @@ class DiffusionConfig(PreTrainedConfig):
             )
 
         is_resnet = self.vision_backbone.startswith("resnet")
+        is_gen_vae = self.vision_backbone.startswith(("sd3vae", "wanvae"))
 
         # Auto-disable ResNet-specific options for ViT backbones.
         if not is_resnet:
@@ -286,6 +300,38 @@ class DiffusionConfig(PreTrainedConfig):
                 f"`cpmae_img_size` ({self.cpmae_img_size}) must be divisible by "
                 f"`cpmae_patch_size` ({self.cpmae_patch_size})."
             )
+        if self.vision_backbone.startswith("sd3vae") and not self.sd3vae_model_name:
+            raise ValueError(
+                "`sd3vae_model_name` must be set when using an SD3 VAE vision backbone "
+                "(e.g. 'stabilityai/stable-diffusion-3-medium-diffusers')."
+            )
+        if self.vision_backbone.startswith("wanvae") and not self.wanvae_model_name:
+            raise ValueError(
+                "`wanvae_model_name` must be set when using a WAN VAE vision backbone "
+                "(e.g. 'Wan-AI/Wan2.1-T2V-14B-Diffusers')."
+            )
+        if is_gen_vae:
+            if self.freeze_backbone:
+                _logger.warning(
+                    "Generation VAE backbones (sd3vae/wanvae) are frozen internally. "
+                    "Setting freeze_backbone=True also freezes the trainable latent "
+                    "projection; consider freeze_backbone=False."
+                )
+            if self.backbone_input_norm != "identity":
+                _logger.warning(
+                    "Generation VAE backbones handle their own [0,1]->[-1,1] scaling; "
+                    "forcing backbone_input_norm from %r to 'identity'.",
+                    self.backbone_input_norm,
+                )
+                self.backbone_input_norm = "identity"
+            current_visual = self.normalization_mapping.get("VISUAL", NormalizationMode.IDENTITY)
+            if current_visual != NormalizationMode.IDENTITY:
+                _logger.warning(
+                    "Generation VAE backbones expect raw [0,1] pixel input; forcing "
+                    "normalization_mapping['VISUAL'] from %s to IDENTITY.",
+                    current_visual,
+                )
+                self.normalization_mapping["VISUAL"] = NormalizationMode.IDENTITY
 
         # Validate the backbone input-normalization preset and auto-disable the pipeline
         # VISUAL normalization when a pretraining preset is selected, to avoid applying

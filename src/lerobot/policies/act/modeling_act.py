@@ -35,6 +35,7 @@ from torchvision.ops.misc import FrozenBatchNorm2d
 
 from lerobot.policies.act.configuration_act import ACTConfig
 from lerobot.policies.pretrained import PreTrainedPolicy
+from lerobot.policies.utils import populate_queues
 from lerobot.utils.backbone_input_norm import BackboneInputNormalizer
 from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
 from lerobot.utils.ssl_backbone import load_ssl_weights_into_resnet
@@ -106,6 +107,24 @@ class ACTPolicy(PreTrainedPolicy):
         else:
             self._action_queue = deque([], maxlen=self.config.n_action_steps)
 
+        if self.config.n_obs_steps > 1:
+            self._obs_queues = {}
+            if self.config.robot_state_feature:
+                self._obs_queues[OBS_STATE] = deque(maxlen=self.config.n_obs_steps)
+            if self.config.image_features:
+                for key in self.config.image_features:
+                    self._obs_queues[key] = deque(maxlen=self.config.n_obs_steps)
+            if self.config.env_state_feature:
+                self._obs_queues[OBS_ENV_STATE] = deque(maxlen=self.config.n_obs_steps)
+            self._cached_task_index = None
+
+    def _build_stacked_obs_batch(self) -> dict[str, Tensor]:
+        """Stack queued observations into (B, T, ...) tensors for multi-obs inference."""
+        batch = {k: torch.stack(list(self._obs_queues[k]), dim=1) for k in self._obs_queues}
+        if self._cached_task_index is not None:
+            batch["task_index"] = self._cached_task_index
+        return batch
+
     @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor]) -> Tensor:
         """Select a single action given environment observations.
@@ -115,6 +134,28 @@ class ACTPolicy(PreTrainedPolicy):
         queue is empty.
         """
         self.eval()  # keeping the policy in eval mode as it could be set to train mode while queue is consumed
+
+        if self.config.n_obs_steps > 1:
+            if "task_index" in batch:
+                self._cached_task_index = batch["task_index"]
+            self._obs_queues = populate_queues(self._obs_queues, batch)
+
+            # Skip the first n_obs_steps-1 actions (they correspond to past timesteps),
+            # matching Diffusion Policy's convention.
+            start = self.config.n_obs_steps - 1
+
+            if self.config.temporal_ensemble_coeff is not None:
+                actions = self.predict_action_chunk(self._build_stacked_obs_batch())
+                actions = actions[:, start:]
+                action = self.temporal_ensembler.update(actions)
+                return action
+
+            if len(self._action_queue) == 0:
+                actions = self.predict_action_chunk(
+                    self._build_stacked_obs_batch()
+                )[:, start : start + self.config.n_action_steps]
+                self._action_queue.extend(actions.transpose(0, 1))
+            return self._action_queue.popleft()
 
         if self.config.temporal_ensemble_coeff is not None:
             actions = self.predict_action_chunk(batch)
@@ -387,6 +428,10 @@ class ACT(nn.Module):
         if self.config.image_features:
             self.encoder_cam_feat_pos_embed = ACTSinusoidalPositionEmbedding2d(config.dim_model // 2)
 
+        # Temporal position embedding for multi-observation-step support.
+        if config.n_obs_steps > 1:
+            self.encoder_obs_temporal_pos_embed = nn.Embedding(config.n_obs_steps, config.dim_model)
+
         # Multi-task conditioning: task token in encoder input.
         if config.num_tasks is not None:
             self.task_embedding = nn.Embedding(config.num_tasks, config.task_embed_dim)
@@ -449,13 +494,17 @@ class ACT(nn.Module):
         batch_size = batch[OBS_IMAGES][0].shape[0] if OBS_IMAGES in batch else batch[OBS_ENV_STATE].shape[0]
 
         # Prepare the latent for input to the transformer encoder.
+        multi_obs = self.config.n_obs_steps > 1
+
         if self.config.use_vae and ACTION in batch and self.training:
             # Prepare the input to the VAE encoder: [cls, *joint_space_configuration, *action_sequence].
             cls_embed = einops.repeat(
                 self.vae_encoder_cls_embed.weight, "1 d -> b 1 d", b=batch_size
             )  # (B, 1, D)
             if self.config.robot_state_feature:
-                robot_state_embed = self.vae_encoder_robot_state_input_proj(batch[OBS_STATE])
+                # VAE uses current (latest) timestep state only.
+                vae_state = batch[OBS_STATE][:, -1] if multi_obs else batch[OBS_STATE]
+                robot_state_embed = self.vae_encoder_robot_state_input_proj(vae_state)
                 robot_state_embed = robot_state_embed.unsqueeze(1)  # (B, 1, D)
             action_embed = self.vae_encoder_action_input_proj(batch[ACTION])  # (B, S, D)
 
@@ -503,52 +552,111 @@ class ACT(nn.Module):
             )
 
         # Prepare transformer encoder inputs.
-        encoder_in_tokens = [self.encoder_latent_input_proj(latent_sample)]
-        encoder_in_pos_embed = list(self.encoder_1d_feature_pos_embed.weight.unsqueeze(1))
-        # Robot state token.
-        if self.config.robot_state_feature:
-            encoder_in_tokens.append(self.encoder_robot_state_input_proj(batch[OBS_STATE]))
-        # Environment state token.
-        if self.config.env_state_feature:
-            encoder_in_tokens.append(self.encoder_env_state_input_proj(batch[OBS_ENV_STATE]))
-
-        # Multi-task: compute task embedding and insert task token.
+        # Multi-task: compute task embedding (needed before image tokens for optional FiLM).
         task_emb = None
         if self.task_embedding is not None:
             task_index = batch["task_index"]
-            # Canonicalize: ensure (B,) LongTensor
             if task_index.dim() == 2:
                 task_index = task_index.squeeze(-1)
             task_index = task_index.long() - self.config.task_index_offset
             task_emb = self.task_embedding(task_index)  # (B, task_embed_dim)
-            task_token = self.encoder_task_proj(task_emb)  # (B, dim_model)
-            encoder_in_tokens.append(task_token)
-            encoder_in_pos_embed.append(self.task_pos_embed.weight[0].unsqueeze(0))  # (1, D)
 
-        if self.config.image_features:
-            # For a list of images, the H and W may vary but H*W is constant.
-            # NOTE: If modifying this section, verify on MPS devices that
-            # gradients remain stable (no explosions or NaNs).
-            for img in batch[OBS_IMAGES]:
-                cam_features = self.backbone(img)["feature_map"]
-                cam_pos_embed = self.encoder_cam_feat_pos_embed(cam_features).to(dtype=cam_features.dtype)
-                cam_features = self.encoder_img_feat_input_proj(cam_features)
+        if multi_obs:
+            # --- Multi-observation-step path ---
+            # Validate temporal dimension.
+            if self.config.robot_state_feature:
+                assert batch[OBS_STATE].shape[1] == self.config.n_obs_steps
+            if self.config.image_features:
+                assert batch[OBS_IMAGES][0].shape[1] == self.config.n_obs_steps
 
-                # Optional FiLM on vision features (ablation).
-                if self.task_film_proj is not None and task_emb is not None:
-                    gamma_beta = self.task_film_proj(task_emb)  # (B, 2*D)
-                    gamma, beta = gamma_beta.chunk(2, dim=-1)  # (B, D) each
-                    # cam_features is (B, D, H, W) — reshape for broadcast
-                    cam_features = (1 + gamma[:, :, None, None]) * cam_features + beta[:, :, None, None]
+            # Tokens: [latent, (task), {state_t, (env_t), cam_pixels_t} for t in 0..T-1]
+            encoder_in_tokens = [self.encoder_latent_input_proj(latent_sample)]
+            encoder_in_pos_embed = [self.encoder_1d_feature_pos_embed.weight[0].unsqueeze(0)]
 
-                # Rearrange features to (sequence, batch, dim).
-                cam_features = einops.rearrange(cam_features, "b c h w -> (h w) b c")
-                cam_pos_embed = einops.rearrange(cam_pos_embed, "b c h w -> (h w) b c")
+            if task_emb is not None:
+                encoder_in_tokens.append(self.encoder_task_proj(task_emb))
+                encoder_in_pos_embed.append(self.task_pos_embed.weight[0].unsqueeze(0))
 
-                # Extend immediately instead of accumulating and concatenating
-                # Convert to list to extend properly
-                encoder_in_tokens.extend(list(cam_features))
-                encoder_in_pos_embed.extend(list(cam_pos_embed))
+            # Precompute FiLM parameters once (shared across timesteps and cameras).
+            film_gamma, film_beta = None, None
+            if self.task_film_proj is not None and task_emb is not None:
+                gamma_beta = self.task_film_proj(task_emb)
+                film_gamma, film_beta = gamma_beta.chunk(2, dim=-1)
+
+            state_pos_idx = 1
+            env_pos_idx = state_pos_idx + (1 if self.config.robot_state_feature else 0)
+
+            for t in range(self.config.n_obs_steps):
+                temporal_pe = self.encoder_obs_temporal_pos_embed.weight[t].unsqueeze(0)  # (1, D)
+
+                if self.config.robot_state_feature:
+                    encoder_in_tokens.append(
+                        self.encoder_robot_state_input_proj(batch[OBS_STATE][:, t])
+                    )
+                    encoder_in_pos_embed.append(
+                        self.encoder_1d_feature_pos_embed.weight[state_pos_idx].unsqueeze(0) + temporal_pe
+                    )
+
+                if self.config.env_state_feature:
+                    encoder_in_tokens.append(
+                        self.encoder_env_state_input_proj(batch[OBS_ENV_STATE][:, t])
+                    )
+                    encoder_in_pos_embed.append(
+                        self.encoder_1d_feature_pos_embed.weight[env_pos_idx].unsqueeze(0) + temporal_pe
+                    )
+
+                if self.config.image_features:
+                    for img in batch[OBS_IMAGES]:
+                        cam_features = self.backbone(img[:, t])["feature_map"]
+                        cam_pos_embed = self.encoder_cam_feat_pos_embed(cam_features).to(
+                            dtype=cam_features.dtype
+                        )
+                        cam_features = self.encoder_img_feat_input_proj(cam_features)
+
+                        if film_gamma is not None:
+                            cam_features = (
+                                (1 + film_gamma[:, :, None, None]) * cam_features + film_beta[:, :, None, None]
+                            )
+
+                        cam_features = einops.rearrange(cam_features, "b c h w -> (h w) b c")
+                        cam_pos_embed = einops.rearrange(cam_pos_embed, "b c h w -> (h w) b c")
+                        cam_pos_embed = cam_pos_embed + temporal_pe.unsqueeze(0)
+
+                        encoder_in_tokens.extend(list(cam_features))
+                        encoder_in_pos_embed.extend(list(cam_pos_embed))
+        else:
+            # --- Original single-observation-step path ---
+            encoder_in_tokens = [self.encoder_latent_input_proj(latent_sample)]
+            encoder_in_pos_embed = list(self.encoder_1d_feature_pos_embed.weight.unsqueeze(1))
+            if self.config.robot_state_feature:
+                encoder_in_tokens.append(self.encoder_robot_state_input_proj(batch[OBS_STATE]))
+            if self.config.env_state_feature:
+                encoder_in_tokens.append(self.encoder_env_state_input_proj(batch[OBS_ENV_STATE]))
+
+            if task_emb is not None:
+                encoder_in_tokens.append(self.encoder_task_proj(task_emb))
+                encoder_in_pos_embed.append(self.task_pos_embed.weight[0].unsqueeze(0))
+
+            if self.config.image_features:
+                for img in batch[OBS_IMAGES]:
+                    cam_features = self.backbone(img)["feature_map"]
+                    cam_pos_embed = self.encoder_cam_feat_pos_embed(cam_features).to(
+                        dtype=cam_features.dtype
+                    )
+                    cam_features = self.encoder_img_feat_input_proj(cam_features)
+
+                    if self.task_film_proj is not None and task_emb is not None:
+                        gamma_beta = self.task_film_proj(task_emb)
+                        gamma, beta = gamma_beta.chunk(2, dim=-1)
+                        cam_features = (
+                            (1 + gamma[:, :, None, None]) * cam_features + beta[:, :, None, None]
+                        )
+
+                    cam_features = einops.rearrange(cam_features, "b c h w -> (h w) b c")
+                    cam_pos_embed = einops.rearrange(cam_pos_embed, "b c h w -> (h w) b c")
+
+                    encoder_in_tokens.extend(list(cam_features))
+                    encoder_in_pos_embed.extend(list(cam_pos_embed))
 
         # Stack all tokens along the sequence dimension.
         encoder_in_tokens = torch.stack(encoder_in_tokens, axis=0)

@@ -10,8 +10,10 @@
 #   mvp_vits        — MVP ViT-S/16 MAE (Xiao et al., NeurIPS 2022; ego-hoi, 384-dim)
 #   vc1_vitb        — VC-1 ViT-B/16 MAE (Majumdar et al., NeurIPS 2023; ego4d+imagenet, 768-dim)
 #   voltron_vcond   — Voltron V-Cond ViT-S/16 (Karamcheti et al. 2023; language-conditioned, 384-dim)
+#   sd3vae          — SD3 VAE encoder (Stability AI; 16-ch latent, 8x spatial, +proj→256-dim)
+#   wanvae          — WAN 2.1 VAE encoder (Alibaba; 16-ch spatiotemporal latent, 8x spatial, +proj→256-dim)
 #
-# Grid: 1 policy × 4 suites × 7 backbones = 28 jobs
+# Grid: 1 policy × 4 suites × N backbones jobs
 # Suites: libero_10, libero_spatial, libero_object, libero_goal
 #
 # Prerequisite for voltron_vcond: `pip install voltron-robotics`
@@ -54,6 +56,9 @@ MVP_VITS_URL="${MVP_VITS_URL:-https://berkeley.box.com/shared/static/m93ynem558j
 VC1_VITB_URL="${VC1_VITB_URL:-https://dl.fbaipublicfiles.com/eai-vc/vc1_vitb.pth}"
 # Voltron cache directory (the voltron-robotics package downloads to `cache/` by default)
 VOLTRON_CACHE_DIR="${VOLTRON_CACHE_DIR:-$HOME/.voltron}"
+# Generation VAE model IDs (HuggingFace)
+SD3VAE_MODEL="${SD3VAE_MODEL:-stabilityai/stable-diffusion-3-medium-diffusers}"
+WANVAE_MODEL="${WANVAE_MODEL:-Wan-AI/Wan2.1-T2V-14B-Diffusers}"
 
 # ── CP-MAE pretrained encoder checkpoints ─────────────────────────
 CPMAE_R200_CKPT="${CPMAE_R200_CKPT:-results/M3_cpmae/R200_cpmae/encoder_best.pt}"
@@ -68,7 +73,7 @@ SUITES=(libero_10 libero_spatial libero_object libero_goal)  #  libero_spatial l
 if [[ -n "${BACKBONES_OVERRIDE:-}" ]]; then
   read -ra BACKBONES <<< "$BACKBONES_OVERRIDE"
 else
-  BACKBONES=(dinov2_vits mocov3_vits vc1_vitb voltron_vcond siglip_vitb mvp_vits cpmae_R200 cpmae_R201_umae cpmae_R300 cpmae_R301 cpmae_R302_vitb cpmae_R303_hybrid)
+  BACKBONES=(dinov2_vits mocov3_vits vc1_vitb voltron_vcond siglip_vitb mvp_vits cpmae_R200 cpmae_R201_umae cpmae_R300 cpmae_R301 cpmae_R302_vitb cpmae_R303_hybrid sd3vae wanvae)
 fi
 
 MAPPING_JSON="scripts/cpmae/task_mapping.json"
@@ -173,6 +178,18 @@ for name in ['facebook/dinov2-small', 'facebook/dinov2-base']:
 print(f'  Loading google/siglip-base-patch16-224...')
 SiglipVisionModel.from_pretrained('google/siglip-base-patch16-224')
 print(f'  google/siglip-base-patch16-224 — cached')
+"
+  echo ""
+
+  echo "Pre-downloading generation VAE encoders (SD3, WAN)..."
+  python3 -c "
+from diffusers import AutoencoderKL, AutoencoderKLWan
+print(f'  Loading SD3 VAE from ${SD3VAE_MODEL}...')
+AutoencoderKL.from_pretrained('${SD3VAE_MODEL}', subfolder='vae')
+print(f'  SD3 VAE — cached')
+print(f'  Loading WAN VAE from ${WANVAE_MODEL}...')
+AutoencoderKLWan.from_pretrained('${WANVAE_MODEL}', subfolder='vae')
+print(f'  WAN VAE — cached')
 "
   echo ""
 
@@ -287,8 +304,9 @@ run_task() {
         # Per-backbone pretraining input normalization.
         local norm_preset="imagenet"
         case "$backbone" in
-            siglip_*) norm_preset="siglip" ;;
-            cpmae_*)  norm_preset="identity" ;;
+            siglip_*)        norm_preset="siglip" ;;
+            cpmae_*)         norm_preset="identity" ;;
+            sd3vae|wanvae)   norm_preset="identity" ;;
         esac
         cmd+=(--policy.backbone_input_norm="$norm_preset")
 
@@ -395,6 +413,27 @@ run_task() {
                     --policy.cpmae_n_heads=6
                 )
                 ;;
+            sd3vae)
+                # freeze_backbone=false: the VAE encoder is already frozen internally
+                # via requires_grad_(False) in SD3VaeBackboneWrapper.__init__.
+                # Setting freeze_backbone=true here would ALSO freeze the trainable
+                # Conv2d latent projection (16->256 channels), which we want to keep.
+                cmd+=(
+                    --policy.vision_backbone=sd3vae
+                    --policy.sd3vae_model_name="$SD3VAE_MODEL"
+                    --policy.freeze_backbone=false
+                    --policy.vae_latent_proj_dim=256
+                )
+                ;;
+            wanvae)
+                # Same freeze logic as sd3vae — see note above.
+                cmd+=(
+                    --policy.vision_backbone=wanvae
+                    --policy.wanvae_model_name="$WANVAE_MODEL"
+                    --policy.freeze_backbone=false
+                    --policy.vae_latent_proj_dim=256
+                )
+                ;;
         esac
     fi
 
@@ -414,6 +453,7 @@ export GPUS REPO_ID RESULTS_DIR STEPS EVAL_FREQ SAVE_FREQ
 export N_EVAL_EPISODES EVAL_BATCH BATCH_SIZE LR SEED
 export MOCOV3_VITS_URL MVP_VITS_URL VC1_VITB_URL VOLTRON_CACHE_DIR
 export CPMAE_R200_CKPT CPMAE_R201_CKPT CPMAE_R300_CKPT CPMAE_R301_CKPT CPMAE_R302_CKPT CPMAE_R303_CKPT
+export SD3VAE_MODEL WANVAE_MODEL
 
 # ── Launch ─────────────────────────────────────────────────────────
 TOTAL_JOBS=$(( ${#SUITES[@]} * ${#BACKBONES[@]} ))
