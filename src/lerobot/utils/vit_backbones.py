@@ -275,6 +275,155 @@ class CpMaeBackboneWrapper(nn.Module):
         return {"feature_map": feature_map}
 
 
+class SD3VaeBackboneWrapper(nn.Module):
+    """Wraps an SD3/SDXL/FLUX VAE encoder as a frozen image feature extractor.
+
+    Maps (B, 3, H, W) images to (B, hidden_size, H/8, W/8) feature maps.
+    The VAE encoder is always frozen internally; an optional trainable 1x1
+    projection expands the thin latent channels (16 for SD3/FLUX, 4 for SDXL)
+    to a richer representation for downstream SpatialSoftmax.
+
+    The frozen encoder processes images in sub-batches of ``encode_batch_size``
+    to bound peak activation memory (the convolutional encoder keeps full
+    spatial resolution at early layers, unlike ViTs that patchify immediately).
+    """
+
+    def __init__(
+        self,
+        model_name: str,
+        subfolder: str = "vae",
+        latent_proj_dim: int = 256,
+        encode_batch_size: int = 8,
+    ):
+        super().__init__()
+        from diffusers import AutoencoderKL
+
+        vae = AutoencoderKL.from_pretrained(model_name, subfolder=subfolder)
+        self.vae_encoder = vae.encoder
+        self.vae_quant_conv = vae.quant_conv  # None in newer diffusers
+        self.vae_encoder.requires_grad_(False)
+        if self.vae_quant_conv is not None:
+            self.vae_quant_conv.requires_grad_(False)
+
+        self._latent_ch = vae.config.latent_channels
+        self._scaling = vae.config.scaling_factor
+        self._shift = getattr(vae.config, "shift_factor", None) or 0.0
+        self._encode_bs = encode_batch_size
+
+        if latent_proj_dim and latent_proj_dim != self._latent_ch:
+            self.latent_proj = nn.Conv2d(self._latent_ch, latent_proj_dim, 1)
+            self.hidden_size = latent_proj_dim
+        else:
+            self.latent_proj = None
+            self.hidden_size = self._latent_ch
+
+    def _encode_chunk(self, x: Tensor) -> Tensor:
+        h = self.vae_encoder(x)
+        if self.vae_quant_conv is not None:
+            h = self.vae_quant_conv(h)
+        return h[:, : self._latent_ch]
+
+    def forward(self, x: Tensor) -> dict[str, Tensor]:
+        x = x * 2.0 - 1.0
+        B = x.shape[0]
+        with torch.no_grad():
+            if B <= self._encode_bs:
+                z = self._encode_chunk(x)
+            else:
+                z = torch.cat(
+                    [self._encode_chunk(x[i : i + self._encode_bs])
+                     for i in range(0, B, self._encode_bs)],
+                    dim=0,
+                )
+        z = (z.detach() - self._shift) * self._scaling
+        if self.latent_proj is not None:
+            z = self.latent_proj(z)
+        return {"feature_map": z}
+
+
+class WanVaeBackboneWrapper(nn.Module):
+    """Wraps a WAN 2.1/2.2 spatiotemporal VAE encoder as a frozen image feature extractor.
+
+    For single-frame input the temporal dimension is unsqueezed before encoding
+    and squeezed after. Maps (B, 3, H, W) to (B, hidden_size, H/8, W/8).
+    Per-channel latent normalization uses WAN 2.1 default statistics.
+
+    Uses chunked encoding (same as SD3VaeBackboneWrapper) to bound VRAM.
+    """
+
+    _DEFAULT_LATENT_MEAN = [
+        -0.7571, -0.7089, -0.9113, 0.1075, -0.1745, 0.9653, -0.1517, 1.5508,
+        0.4134, -0.0715, 0.5517, -0.3632, -0.1922, -0.9497, 0.2503, -0.2921,
+    ]
+    _DEFAULT_LATENT_STD = [
+        2.8184, 1.4541, 2.3275, 2.6558, 1.2196, 1.7708, 2.6052, 2.0743,
+        3.2687, 2.1526, 2.8652, 1.5579, 1.6382, 1.1253, 2.8251, 1.9160,
+    ]
+
+    def __init__(
+        self,
+        model_name: str,
+        subfolder: str = "vae",
+        latent_proj_dim: int = 256,
+        encode_batch_size: int = 8,
+    ):
+        super().__init__()
+        from diffusers import AutoencoderKLWan
+
+        vae = AutoencoderKLWan.from_pretrained(model_name, subfolder=subfolder)
+        self.vae_encoder = vae.encoder
+        self.vae_quant_conv = vae.quant_conv  # None in newer diffusers
+        self.vae_encoder.requires_grad_(False)
+        if self.vae_quant_conv is not None:
+            self.vae_quant_conv.requires_grad_(False)
+
+        self._latent_ch = getattr(vae.config, "z_dim", None) or vae.config.latent_channels
+        self._encode_bs = encode_batch_size
+
+        latent_mean = getattr(vae.config, "latents_mean", None) or self._DEFAULT_LATENT_MEAN
+        latent_std = getattr(vae.config, "latents_std", None) or self._DEFAULT_LATENT_STD
+        self.register_buffer(
+            "_latent_mean", torch.tensor(latent_mean).view(1, -1, 1, 1)
+        )
+        self.register_buffer(
+            "_latent_inv_std",
+            (1.0 / torch.tensor(latent_std)).view(1, -1, 1, 1),
+        )
+
+        if latent_proj_dim and latent_proj_dim != self._latent_ch:
+            self.latent_proj = nn.Conv2d(self._latent_ch, latent_proj_dim, 1)
+            self.hidden_size = latent_proj_dim
+        else:
+            self.latent_proj = None
+            self.hidden_size = self._latent_ch
+
+    def _encode_chunk(self, x: Tensor) -> Tensor:
+        """Encode a single sub-batch: (b, 3, H, W) → (b, latent_ch, H/8, W/8)."""
+        x5d = x.unsqueeze(2)  # (b, 3, 1, H, W)
+        h = self.vae_encoder(x5d)
+        if self.vae_quant_conv is not None:
+            h = self.vae_quant_conv(h)
+        return h[:, : self._latent_ch, 0]  # squeeze temporal
+
+    def forward(self, x: Tensor) -> dict[str, Tensor]:
+        x = x * 2.0 - 1.0
+        B = x.shape[0]
+        with torch.no_grad():
+            if B <= self._encode_bs:
+                z = self._encode_chunk(x)
+            else:
+                z = torch.cat(
+                    [self._encode_chunk(x[i : i + self._encode_bs])
+                     for i in range(0, B, self._encode_bs)],
+                    dim=0,
+                )
+        z = z.detach()
+        z = (z - self._latent_mean) * self._latent_inv_std
+        if self.latent_proj is not None:
+            z = self.latent_proj(z)
+        return {"feature_map": z}
+
+
 def build_vit_backbone(config) -> nn.Module:
     """Build a ViT backbone wrapper from a policy config object.
 
@@ -303,6 +452,20 @@ def build_vit_backbone(config) -> nn.Module:
             embed_dim=config.cpmae_embed_dim,
             depth=config.cpmae_depth,
             n_heads=config.cpmae_n_heads,
+        )
+    elif config.vision_backbone.startswith("sd3vae"):
+        return SD3VaeBackboneWrapper(
+            model_name=config.sd3vae_model_name,
+            subfolder=config.sd3vae_subfolder,
+            latent_proj_dim=config.vae_latent_proj_dim,
+            encode_batch_size=config.vae_encode_batch_size,
+        )
+    elif config.vision_backbone.startswith("wanvae"):
+        return WanVaeBackboneWrapper(
+            model_name=config.wanvae_model_name,
+            subfolder=config.wanvae_subfolder,
+            latent_proj_dim=config.vae_latent_proj_dim,
+            encode_batch_size=config.vae_encode_batch_size,
         )
     else:
         raise ValueError(f"No ViT wrapper for backbone prefix: {config.vision_backbone}")
