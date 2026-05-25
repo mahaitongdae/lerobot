@@ -15,7 +15,7 @@ from lerobot.policies.diffusion.modeling_diffusion import (
     _FeatureMapDictToTensor,
 )
 from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE
-from lerobot.utils.vit_backbones import Dinov2BackboneWrapper, SiglipBackboneWrapper
+from lerobot.utils.vit_backbones import Dinov2BackboneWrapper, SiglipBackboneWrapper, VJepa2BackboneWrapper
 
 
 # ── Fake backbone stubs ─────────────────────────────────────────────
@@ -96,6 +96,32 @@ class FakeSiglipModel(nn.Module):
         return FakeSiglipOutput(last_hidden_state=hidden)
 
 
+VJEPA_HIDDEN = 32
+VJEPA_PATCH = 16
+VJEPA_IMAGE = 384
+VJEPA_GRID = VJEPA_IMAGE // VJEPA_PATCH  # 24
+
+
+class FakeVJepa2Encoder(nn.Module):
+    embed_dim = VJEPA_HIDDEN
+    patch_size = VJEPA_PATCH
+    img_height = VJEPA_IMAGE
+    img_width = VJEPA_IMAGE
+
+    def __init__(self):
+        super().__init__()
+        self.proj = nn.Linear(1, VJEPA_HIDDEN)
+        self.last_input_shape = None
+
+    def forward(self, x):
+        self.last_input_shape = tuple(x.shape)
+        b, _c, t, _h, _w = x.shape
+        patches = x.unfold(3, VJEPA_PATCH, VJEPA_PATCH).unfold(4, VJEPA_PATCH, VJEPA_PATCH)
+        patch_means = patches.contiguous().mean(dim=(1, 5, 6))
+        tokens = patch_means.reshape(b, t * VJEPA_GRID * VJEPA_GRID, 1)
+        return self.proj(tokens)
+
+
 def _fake_dinov2_init(self, model_name: str, image_size: int = 224):
     nn.Module.__init__(self)
     fake = FakeDinov2Model()
@@ -126,6 +152,13 @@ def fake_dinov2():
 def fake_siglip():
     with patch.object(SiglipBackboneWrapper, "__init__", _fake_siglip_init):
         yield
+
+
+@pytest.fixture
+def fake_vjepa2():
+    encoder = FakeVJepa2Encoder()
+    with patch("torch.hub.load", return_value=(encoder, object())):
+        yield encoder
 
 
 # ── Config helpers ───────────────────────────────────────────────────
@@ -252,6 +285,60 @@ class TestDiffusionConfigViT:
                 cpmae_patch_size=15,
             )
 
+    def test_vjepa2_config_valid(self):
+        c = _make_dp_config(vision_backbone="vjepa2")
+        assert c.vision_backbone == "vjepa2"
+        assert c.vjepa2_model_name == "vjepa2_1_vit_base_384"
+
+    def test_vjepa2_config_requires_repo(self):
+        with pytest.raises(ValueError, match="vjepa2_repo_or_dir"):
+            _make_dp_config(vision_backbone="vjepa2", vjepa2_repo_or_dir="")
+
+    def test_vjepa2_config_requires_model_name(self):
+        with pytest.raises(ValueError, match="vjepa2_model_name"):
+            _make_dp_config(vision_backbone="vjepa2", vjepa2_model_name="")
+
+    def test_vjepa2_config_requires_positive_input_frames(self):
+        with pytest.raises(ValueError, match="vjepa2_input_frames"):
+            _make_dp_config(vision_backbone="vjepa2", vjepa2_input_frames=0)
+
+    def test_vjepa2_config_requires_positive_spatial_pool(self):
+        with pytest.raises(ValueError, match="vjepa2_spatial_pool_size"):
+            _make_dp_config(vision_backbone="vjepa2", vjepa2_spatial_pool_size=0)
+
+
+# ══════════════════════════════════════════════════════════════════════
+# V-JEPA2 backbone wrapper smoke tests
+# ══════════════════════════════════════════════════════════════════════
+
+
+class TestVJepa2BackboneWrapper:
+    def test_wrapper_output_shape(self, fake_vjepa2):
+        wrapper = VJepa2BackboneWrapper()
+        x = torch.randn(2, 3, VJEPA_IMAGE, VJEPA_IMAGE)
+        out = wrapper(x)
+        assert out["feature_map"].shape == (2, VJEPA_HIDDEN, VJEPA_GRID, VJEPA_GRID)
+
+    def test_wrapper_auto_resizes(self, fake_vjepa2):
+        wrapper = VJepa2BackboneWrapper()
+        x = torch.randn(1, 3, IMAGE_SIZE, IMAGE_SIZE)
+        out = wrapper(x)
+        assert out["feature_map"].shape == (1, VJEPA_HIDDEN, VJEPA_GRID, VJEPA_GRID)
+        assert fake_vjepa2.last_input_shape == (1, 3, 1, VJEPA_IMAGE, VJEPA_IMAGE)
+
+    def test_wrapper_averages_temporal_tokens(self, fake_vjepa2):
+        wrapper = VJepa2BackboneWrapper(input_frames=2)
+        x = torch.randn(1, 3, VJEPA_IMAGE, VJEPA_IMAGE)
+        out = wrapper(x)
+        assert out["feature_map"].shape == (1, VJEPA_HIDDEN, VJEPA_GRID, VJEPA_GRID)
+        assert fake_vjepa2.last_input_shape == (1, 3, 2, VJEPA_IMAGE, VJEPA_IMAGE)
+
+    def test_wrapper_spatial_pooling(self, fake_vjepa2):
+        wrapper = VJepa2BackboneWrapper(spatial_pool_size=16)
+        x = torch.randn(1, 3, VJEPA_IMAGE, VJEPA_IMAGE)
+        out = wrapper(x)
+        assert out["feature_map"].shape == (1, VJEPA_HIDDEN, 16, 16)
+
 
 # ══════════════════════════════════════════════════════════════════════
 # DiffusionRgbEncoder smoke tests
@@ -301,6 +388,14 @@ class TestDiffusionRgbEncoderSiglip:
         x = torch.randn(1, 3, SIGLIP_IMAGE, SIGLIP_IMAGE)
         out = encoder(x)
         assert not torch.isnan(out).any()
+
+
+class TestDiffusionRgbEncoderVJepa2:
+    def test_freeze_backbone(self, fake_vjepa2):
+        config = _make_dp_config(vision_backbone="vjepa2", freeze_backbone=True)
+        encoder = DiffusionRgbEncoder(config)
+        for p in encoder.backbone.parameters():
+            assert not p.requires_grad
 
 
 class TestDiffusionRgbEncoderResnet:

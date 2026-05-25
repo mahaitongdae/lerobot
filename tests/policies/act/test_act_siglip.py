@@ -199,7 +199,7 @@ def test_siglip_wrapper_auto_resizes(fake_siglip):
 def test_act_siglip_instantiation(fake_siglip):
     config = _make_siglip_config()
     model = ACT(config)
-    assert isinstance(model.backbone, SiglipBackboneWrapper)
+    assert isinstance(model.backbone.backbone, SiglipBackboneWrapper)
     assert hasattr(model, "encoder_img_feat_input_proj")
     assert hasattr(model, "encoder_cam_feat_pos_embed")
 

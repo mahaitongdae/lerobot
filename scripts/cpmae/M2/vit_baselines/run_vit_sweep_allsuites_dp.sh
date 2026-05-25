@@ -475,6 +475,8 @@ else
     env_parallel --bar \
         --results "${RESULTS_DIR}/logs" \
         -P "${PARALLEL}" \
+        --memfree 8G \
+        --memsuspend 4G \
         run_task {1} {2} {%} \
         ::: "${SUITES[@]}" \
         ::: "${BACKBONES[@]}"

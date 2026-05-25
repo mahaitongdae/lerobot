@@ -1,0 +1,17 @@
+{
+  "exclude": [
+    "**/node_modules",
+    "**/__pycache__",
+    "**/.venv",
+    "**/venv",
+    "results",
+    "**/results",
+    "**/stderr",
+    "**/stdout",
+    "**/*.log"
+  ],
+  "ignore": [
+    "**/stderr",
+    "**/stdout"
+  ]
+}

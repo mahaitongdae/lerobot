@@ -20,6 +20,38 @@ except ImportError:
 from lerobot.utils.ssl_backbone import load_mocov3_weights_into_vit
 
 
+_VJEPA2_PUBLIC_BASE_URL = "https://dl.fbaipublicfiles.com/vjepa2"
+_VJEPA2_CHECKPOINT_FILES = {
+    "vit_large": "vitl",
+    "vit_huge": "vith",
+    "vit_giant": "vitg",
+    "vit_ac_giant": "vjepa2-ac-vitg",
+    "vit_giant_384": "vitg-384",
+    "vjepa2_1_vit_base_384": "vjepa2_1_vitb_dist_vitG_384",
+    "vjepa2_1_vit_large_384": "vjepa2_1_vitl_dist_vitG_384",
+    "vjepa2_1_vit_giant_384": "vjepa2_1_vitg_384",
+    "vjepa2_1_vit_gigantic_384": "vjepa2_1_vitG_384",
+}
+
+
+def _clean_vjepa2_state_dict(state_dict: dict[str, Tensor]) -> dict[str, Tensor]:
+    return {
+        key.replace("module.", "").replace("backbone.", ""): val
+        for key, val in state_dict.items()
+    }
+
+
+def _default_vjepa2_checkpoint_url(model_name: str) -> str:
+    try:
+        checkpoint_file = _VJEPA2_CHECKPOINT_FILES[model_name]
+    except KeyError as exc:
+        raise ValueError(
+            f"No default V-JEPA2 checkpoint URL is known for model_name={model_name!r}. "
+            "Set `vjepa2_checkpoint_url` to a local checkpoint path or URL."
+        ) from exc
+    return f"{_VJEPA2_PUBLIC_BASE_URL}/{checkpoint_file}.pt"
+
+
 class SiglipBackboneWrapper(nn.Module):
     """Wraps a SigLIP vision model to produce 2D feature maps.
 
@@ -275,18 +307,171 @@ class CpMaeBackboneWrapper(nn.Module):
         return {"feature_map": feature_map}
 
 
+class VJepa2BackboneWrapper(nn.Module):
+    """Wraps a V-JEPA 2 / 2.1 PyTorch Hub encoder to produce 2D feature maps.
+
+    Meta's PyTorch Hub V-JEPA encoders expect videos as ``(B, C, T, H, W)``.
+    For image-only policy observations, this wrapper inserts/repeats the temporal
+    dimension, then averages temporal patch groups back to one spatial feature map.
+    """
+
+    def __init__(
+        self,
+        repo_or_dir: str = "facebookresearch/vjepa2",
+        model_name: str = "vjepa2_1_vit_base_384",
+        input_frames: int = 1,
+        spatial_pool_size: int | None = None,
+        checkpoint_url: str | None = None,
+    ):
+        super().__init__()
+        if input_frames < 1:
+            raise ValueError(f"`input_frames` must be >= 1. Got {input_frames}.")
+
+        from pathlib import Path
+
+        hub_source = "local" if Path(repo_or_dir).exists() else "github"
+        # Upstream V-JEPA2 hub currently points pretrained=True at localhost in
+        # some snapshots, so instantiate the architecture first and load weights here.
+        hub_kwargs = {"source": hub_source, "pretrained": False}
+        if hub_source == "github":
+            hub_kwargs["trust_repo"] = True
+
+        loaded = torch.hub.load(repo_or_dir, model_name, **hub_kwargs)
+        self.encoder = loaded[0] if isinstance(loaded, (tuple, list)) else loaded
+        self.predictor = loaded[1] if isinstance(loaded, (tuple, list)) and len(loaded) > 1 else None
+
+        checkpoint_url = checkpoint_url or _default_vjepa2_checkpoint_url(model_name)
+        checkpoint_path = Path(checkpoint_url)
+        if checkpoint_path.exists():
+            state_dict = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+        else:
+            state_dict = torch.hub.load_state_dict_from_url(checkpoint_url, map_location="cpu")
+
+        encoder_key = "ema_encoder" if model_name.startswith("vjepa2_1") else "target_encoder"
+        if encoder_key not in state_dict:
+            encoder_key = "encoder"
+        encoder_state_dict = _clean_vjepa2_state_dict(state_dict[encoder_key])
+        strict = model_name.startswith("vjepa2_1")
+        self.encoder.load_state_dict(encoder_state_dict, strict=strict)
+        if self.predictor is not None and "predictor" in state_dict:
+            predictor_state_dict = _clean_vjepa2_state_dict(state_dict["predictor"])
+            self.predictor.load_state_dict(predictor_state_dict, strict=strict)
+
+        self.repo_or_dir = repo_or_dir
+        self.model_name = model_name
+        self.checkpoint_url = checkpoint_url
+        self.input_frames = input_frames
+
+        self.hidden_size = int(
+            getattr(self.encoder, "embed_dim", getattr(self.encoder, "num_features", 768))
+        )
+        self.patch_size = int(getattr(self.encoder, "patch_size", 16))
+        self.image_size = int(
+            getattr(self.encoder, "img_height", getattr(self.encoder, "image_size", 384))
+        )
+        self.grid_size = self.image_size // self.patch_size
+        self._spatial_tokens = self.grid_size * self.grid_size
+        self._pool = nn.AdaptiveAvgPool2d(spatial_pool_size) if spatial_pool_size is not None else None
+
+    @staticmethod
+    def _extract_tokens(output) -> Tensor:
+        if isinstance(output, Tensor):
+            return output
+        if hasattr(output, "last_hidden_state"):
+            return output.last_hidden_state
+        if isinstance(output, dict):
+            for key in ("last_hidden_state", "hidden_state", "x"):
+                if key in output:
+                    return output[key]
+        if isinstance(output, (tuple, list)) and output:
+            for item in reversed(output):
+                if isinstance(item, Tensor):
+                    return item
+        raise TypeError(f"Could not extract V-JEPA2 token tensor from output type {type(output)!r}.")
+
+    def forward(self, x: Tensor) -> dict[str, Tensor]:
+        if x.shape[-2:] != (self.image_size, self.image_size):
+            x = F.interpolate(x, size=(self.image_size, self.image_size), mode="bilinear", align_corners=False)
+
+        video = x.unsqueeze(2)
+        if self.input_frames > 1:
+            video = video.repeat(1, 1, self.input_frames, 1, 1)
+
+        patches = self._extract_tokens(self.encoder(video))
+        if patches.ndim != 3:
+            raise ValueError(f"Expected V-JEPA2 tokens with shape (B, N, C), got {tuple(patches.shape)}.")
+
+        n_tokens = patches.shape[1]
+        if n_tokens == self._spatial_tokens:
+            feature_map = einops.rearrange(
+                patches, "b (h w) c -> b c h w", h=self.grid_size, w=self.grid_size
+            )
+        elif n_tokens % self._spatial_tokens == 0:
+            n_temporal = n_tokens // self._spatial_tokens
+            feature_map = einops.rearrange(
+                patches,
+                "b (t h w) c -> b c t h w",
+                t=n_temporal,
+                h=self.grid_size,
+                w=self.grid_size,
+            ).mean(dim=2)
+        else:
+            raise ValueError(
+                "Cannot reshape V-JEPA2 tokens into a square feature map: "
+                f"got {n_tokens} tokens, expected {self._spatial_tokens} or a temporal multiple."
+            )
+
+        if self._pool is not None:
+            feature_map = self._pool(feature_map)
+        return {"feature_map": feature_map}
+
+
 class SD3VaeBackboneWrapper(nn.Module):
     """Wraps an SD3/SDXL/FLUX VAE encoder as a frozen image feature extractor.
 
-    Maps (B, 3, H, W) images to (B, hidden_size, H/8, W/8) feature maps.
+    Maps (B, 3, H, W) images to (B, hidden_size, pool_size, pool_size) feature maps.
     The VAE encoder is always frozen internally; an optional trainable 1x1
-    projection expands the thin latent channels (16 for SD3/FLUX, 4 for SDXL)
-    to a richer representation for downstream SpatialSoftmax.
+    projection expands the selected VAE feature tensor to a richer
+    representation for downstream SpatialSoftmax.
 
     The frozen encoder processes images in sub-batches of ``encode_batch_size``
     to bound peak activation memory (the convolutional encoder keeps full
     spatial resolution at early layers, unlike ViTs that patchify immediately).
+
+    ``feature_layer`` selects which representation to expose:
+        - "latent_mean": current behavior, the scaled first latent_channels
+          channels after quant_conv.
+        - "latent_moments": all post-quant_conv channels, typically mean and
+          logvar. The mean half is scaled like "latent_mean".
+        - "encoder_out": encoder output before quant_conv.
+        - "mid_block" or module paths like "down_blocks.2": intermediate
+          encoder activations captured by a forward hook.
+
+    When ``spatial_pool_size`` is set, an adaptive average pool reduces the
+    native 28x28 latent (from 224px input) to a smaller grid. This is critical
+    for ACT-style policies that flatten spatial tokens into the transformer
+    sequence - 28x28=784 tokens causes O(n^2) attention OOM, while 14x14=196
+    matches ViT token counts.
     """
+
+    _LATENT_MEAN = "latent_mean"
+    _LATENT_MOMENTS = "latent_moments"
+    _ENCODER_OUT = "encoder_out"
+    _ALIASES = {
+        "latent": _LATENT_MEAN,
+        "moments": _LATENT_MOMENTS,
+        "full_latent": _LATENT_MOMENTS,
+        "encoder": _ENCODER_OUT,
+        "down1": "down_blocks.1",
+        "down2": "down_blocks.2",
+        "down3": "down_blocks.3",
+        "down_block1": "down_blocks.1",
+        "down_block2": "down_blocks.2",
+        "down_block3": "down_blocks.3",
+        "down_blocks_1": "down_blocks.1",
+        "down_blocks_2": "down_blocks.2",
+        "down_blocks_3": "down_blocks.3",
+    }
 
     def __init__(
         self,
@@ -294,6 +479,8 @@ class SD3VaeBackboneWrapper(nn.Module):
         subfolder: str = "vae",
         latent_proj_dim: int = 256,
         encode_batch_size: int = 8,
+        spatial_pool_size: int | None = None,
+        feature_layer: str = "latent_mean",
     ):
         super().__init__()
         from diffusers import AutoencoderKL
@@ -301,6 +488,7 @@ class SD3VaeBackboneWrapper(nn.Module):
         vae = AutoencoderKL.from_pretrained(model_name, subfolder=subfolder)
         self.vae_encoder = vae.encoder
         self.vae_quant_conv = vae.quant_conv  # None in newer diffusers
+        self.feature_layer = self._normalize_feature_layer(feature_layer)
         self.vae_encoder.requires_grad_(False)
         if self.vae_quant_conv is not None:
             self.vae_quant_conv.requires_grad_(False)
@@ -310,18 +498,118 @@ class SD3VaeBackboneWrapper(nn.Module):
         self._shift = getattr(vae.config, "shift_factor", None) or 0.0
         self._encode_bs = encode_batch_size
 
-        if latent_proj_dim and latent_proj_dim != self._latent_ch:
-            self.latent_proj = nn.Conv2d(self._latent_ch, latent_proj_dim, 1)
+        if spatial_pool_size is not None:
+            self._pool = nn.AdaptiveAvgPool2d(spatial_pool_size)
+        else:
+            self._pool = None
+
+        feature_ch = self._infer_feature_channels()
+        if latent_proj_dim and latent_proj_dim != feature_ch:
+            if feature_ch is None:
+                self.latent_proj = nn.LazyConv2d(latent_proj_dim, 1)
+            else:
+                self.latent_proj = nn.Conv2d(feature_ch, latent_proj_dim, 1)
             self.hidden_size = latent_proj_dim
         else:
+            if feature_ch is None:
+                raise ValueError(
+                    "Cannot infer channels for SD3 VAE feature_layer="
+                    f"{self.feature_layer!r} with vae_latent_proj_dim=None. "
+                    "Set `vae_latent_proj_dim` so a LazyConv2d projection can be used."
+                )
             self.latent_proj = None
-            self.hidden_size = self._latent_ch
+            self.hidden_size = feature_ch
+
+    @classmethod
+    def _normalize_feature_layer(cls, feature_layer: str) -> str:
+        normalized = feature_layer.strip()
+        return cls._ALIASES.get(normalized, normalized)
+
+    @staticmethod
+    def _get_module(root: nn.Module, path: str) -> nn.Module:
+        module: nn.Module | nn.ModuleList = root
+        for part in path.split("."):
+            if part.isdigit():
+                try:
+                    module = module[int(part)]  # type: ignore[index]
+                except (IndexError, TypeError) as exc:
+                    raise ValueError(f"Could not resolve SD3 VAE encoder module path {path!r}.") from exc
+            else:
+                if not hasattr(module, part):
+                    raise ValueError(f"Could not resolve SD3 VAE encoder module path {path!r}.")
+                module = getattr(module, part)
+        if not isinstance(module, nn.Module):
+            raise ValueError(f"SD3 VAE encoder path {path!r} did not resolve to a torch module.")
+        return module
+
+    @staticmethod
+    def _infer_module_out_channels(module: nn.Module | None) -> int | None:
+        if module is None:
+            return None
+
+        out_channels = getattr(module, "out_channels", None)
+        if isinstance(out_channels, int):
+            return out_channels
+
+        for attr in ("conv_out", "conv2", "conv", "proj_out"):
+            child = getattr(module, attr, None)
+            out_channels = getattr(child, "out_channels", None)
+            if isinstance(out_channels, int):
+                return out_channels
+
+        resnets = getattr(module, "resnets", None)
+        if resnets:
+            return SD3VaeBackboneWrapper._infer_module_out_channels(resnets[-1])
+
+        return None
+
+    def _infer_feature_channels(self) -> int | None:
+        if self.feature_layer == self._LATENT_MEAN:
+            return self._latent_ch
+        if self.feature_layer == self._LATENT_MOMENTS:
+            return self._infer_module_out_channels(self.vae_quant_conv)
+        if self.feature_layer == self._ENCODER_OUT:
+            return self._infer_module_out_channels(self.vae_encoder)
+        return self._infer_module_out_channels(self._get_module(self.vae_encoder, self.feature_layer))
+
+    @staticmethod
+    def _first_tensor(output) -> Tensor:
+        if isinstance(output, Tensor):
+            return output
+        if isinstance(output, (tuple, list)) and output and isinstance(output[0], Tensor):
+            return output[0]
+        raise TypeError(f"Expected SD3 VAE feature hook output to be a tensor, got {type(output)!r}.")
+
+    def _scale_latent_moments(self, h: Tensor) -> Tensor:
+        mean = (h[:, : self._latent_ch] - self._shift) * self._scaling
+        if h.shape[1] <= self._latent_ch:
+            return mean
+        return torch.cat([mean, h[:, self._latent_ch :]], dim=1)
 
     def _encode_chunk(self, x: Tensor) -> Tensor:
-        h = self.vae_encoder(x)
-        if self.vae_quant_conv is not None:
-            h = self.vae_quant_conv(h)
-        return h[:, : self._latent_ch]
+        if self.feature_layer in (self._LATENT_MEAN, self._LATENT_MOMENTS, self._ENCODER_OUT):
+            h = self.vae_encoder(x)
+            if self.feature_layer == self._ENCODER_OUT:
+                return h
+            if self.vae_quant_conv is not None:
+                h = self.vae_quant_conv(h)
+            if self.feature_layer == self._LATENT_MOMENTS:
+                return self._scale_latent_moments(h)
+            return self._scale_latent_moments(h)[:, : self._latent_ch]
+
+        features: dict[str, Tensor] = {}
+
+        def save_feature(_module, _inputs, output):
+            features["value"] = self._first_tensor(output)
+
+        handle = self._get_module(self.vae_encoder, self.feature_layer).register_forward_hook(save_feature)
+        try:
+            self.vae_encoder(x)
+        finally:
+            handle.remove()
+        if "value" not in features:
+            raise RuntimeError(f"SD3 VAE feature hook {self.feature_layer!r} did not capture an output.")
+        return features["value"]
 
     def forward(self, x: Tensor) -> dict[str, Tensor]:
         x = x * 2.0 - 1.0
@@ -335,7 +623,9 @@ class SD3VaeBackboneWrapper(nn.Module):
                      for i in range(0, B, self._encode_bs)],
                     dim=0,
                 )
-        z = (z.detach() - self._shift) * self._scaling
+        z = z.detach()
+        if self._pool is not None:
+            z = self._pool(z)
         if self.latent_proj is not None:
             z = self.latent_proj(z)
         return {"feature_map": z}
@@ -453,12 +743,22 @@ def build_vit_backbone(config) -> nn.Module:
             depth=config.cpmae_depth,
             n_heads=config.cpmae_n_heads,
         )
+    elif config.vision_backbone.startswith("vjepa2"):
+        return VJepa2BackboneWrapper(
+            repo_or_dir=config.vjepa2_repo_or_dir,
+            model_name=config.vjepa2_model_name,
+            input_frames=config.vjepa2_input_frames,
+            spatial_pool_size=getattr(config, "vjepa2_spatial_pool_size", None),
+            checkpoint_url=getattr(config, "vjepa2_checkpoint_url", None),
+        )
     elif config.vision_backbone.startswith("sd3vae"):
         return SD3VaeBackboneWrapper(
             model_name=config.sd3vae_model_name,
             subfolder=config.sd3vae_subfolder,
             latent_proj_dim=config.vae_latent_proj_dim,
             encode_batch_size=config.vae_encode_batch_size,
+            spatial_pool_size=getattr(config, "vae_spatial_pool_size", None),
+            feature_layer=getattr(config, "sd3vae_feature_layer", "latent_mean"),
         )
     elif config.vision_backbone.startswith("wanvae"):
         return WanVaeBackboneWrapper(

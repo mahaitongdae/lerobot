@@ -144,9 +144,20 @@ class DiffusionConfig(PreTrainedConfig):
     cpmae_embed_dim: int = 384
     cpmae_depth: int = 12
     cpmae_n_heads: int = 6
+    # V-JEPA 2 / 2.1 backbone (used when vision_backbone starts with "vjepa2").
+    vjepa2_repo_or_dir: str = "facebookresearch/vjepa2"
+    vjepa2_model_name: str = "vjepa2_1_vit_base_384"
+    # Optional local path or URL. If None, uses Meta's public fbaipublicfiles checkpoint URL.
+    vjepa2_checkpoint_url: str | None = None
+    vjepa2_input_frames: int = 1
+    vjepa2_spatial_pool_size: int | None = None
     # SD3/SDXL/FLUX VAE backbone (used when vision_backbone starts with "sd3vae").
     sd3vae_model_name: str = "stabilityai/stable-diffusion-3-medium-diffusers"
     sd3vae_subfolder: str = "vae"
+    # Feature tensor to expose from the SD3 VAE encoder. "latent_mean" preserves
+    # the original behavior; values like "latent_moments", "mid_block", and
+    # "down_blocks.2" enable control-oriented feature probes.
+    sd3vae_feature_layer: str = "latent_mean"
     # WAN 2.1/2.2 VAE backbone (used when vision_backbone starts with "wanvae").
     wanvae_model_name: str = "Wan-AI/Wan2.1-T2V-14B-Diffusers"
     wanvae_subfolder: str = "vae"
@@ -157,6 +168,9 @@ class DiffusionConfig(PreTrainedConfig):
     # batch (batch_size × n_obs_steps × n_cameras) is chunked to this size to
     # bound peak VRAM from convolutional activation maps.
     vae_encode_batch_size: int = 64
+    # Spatial pooling for VAE latents. None = keep native resolution (28×28 for 224px).
+    # Diffusion policy uses SpatialSoftmax so this is typically not needed.
+    vae_spatial_pool_size: int | None = None
     use_group_norm: bool = True
     # Per-backbone pretraining input normalization applied inside the model, AFTER any
     # dataset-statistic normalization. Use this to match the pixel statistics the backbone
@@ -225,7 +239,17 @@ class DiffusionConfig(PreTrainedConfig):
         super().__post_init__()
 
         """Input validation (not exhaustive)."""
-        supported_prefixes = ("resnet", "siglip", "dinov2", "mocov3", "voltron", "cpmae", "sd3vae", "wanvae")
+        supported_prefixes = (
+            "resnet",
+            "siglip",
+            "dinov2",
+            "mocov3",
+            "voltron",
+            "cpmae",
+            "vjepa2",
+            "sd3vae",
+            "wanvae",
+        )
         if not any(self.vision_backbone.startswith(p) for p in supported_prefixes):
             raise ValueError(
                 f"`vision_backbone` must start with one of {supported_prefixes}. "
@@ -300,11 +324,27 @@ class DiffusionConfig(PreTrainedConfig):
                 f"`cpmae_img_size` ({self.cpmae_img_size}) must be divisible by "
                 f"`cpmae_patch_size` ({self.cpmae_patch_size})."
             )
+        if self.vision_backbone.startswith("vjepa2") and not self.vjepa2_repo_or_dir:
+            raise ValueError("`vjepa2_repo_or_dir` must be set when using a V-JEPA2 vision backbone.")
+        if self.vision_backbone.startswith("vjepa2") and not self.vjepa2_model_name:
+            raise ValueError("`vjepa2_model_name` must be set when using a V-JEPA2 vision backbone.")
+        if self.vision_backbone.startswith("vjepa2") and self.vjepa2_input_frames < 1:
+            raise ValueError(f"`vjepa2_input_frames` must be >= 1. Got {self.vjepa2_input_frames}.")
+        if (
+            self.vision_backbone.startswith("vjepa2")
+            and self.vjepa2_spatial_pool_size is not None
+            and self.vjepa2_spatial_pool_size < 1
+        ):
+            raise ValueError(
+                f"`vjepa2_spatial_pool_size` must be >= 1 or None. Got {self.vjepa2_spatial_pool_size}."
+            )
         if self.vision_backbone.startswith("sd3vae") and not self.sd3vae_model_name:
             raise ValueError(
                 "`sd3vae_model_name` must be set when using an SD3 VAE vision backbone "
                 "(e.g. 'stabilityai/stable-diffusion-3-medium-diffusers')."
             )
+        if self.vision_backbone.startswith("sd3vae") and not self.sd3vae_feature_layer:
+            raise ValueError("`sd3vae_feature_layer` must be non-empty when using an SD3 VAE backbone.")
         if self.vision_backbone.startswith("wanvae") and not self.wanvae_model_name:
             raise ValueError(
                 "`wanvae_model_name` must be set when using a WAN VAE vision backbone "

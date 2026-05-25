@@ -67,6 +67,37 @@ def _make_dinov2_config(
     )
 
 
+def _make_vjepa2_config(**overrides):
+    input_features = {
+        f"{OBS_IMAGES}.cam0": PolicyFeature(type=FeatureType.VISUAL, shape=(3, IMAGE_SIZE, IMAGE_SIZE)),
+        OBS_STATE: PolicyFeature(type=FeatureType.STATE, shape=(8,)),
+    }
+    output_features = {ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,))}
+    defaults = dict(
+        input_features=input_features,
+        output_features=output_features,
+        normalization_mapping={
+            "VISUAL": NormalizationMode.IDENTITY,
+            "STATE": NormalizationMode.IDENTITY,
+            "ACTION": NormalizationMode.IDENTITY,
+        },
+        vision_backbone="vjepa2",
+        pretrained_backbone_weights=None,
+        chunk_size=5,
+        n_action_steps=5,
+        dim_model=64,
+        n_heads=4,
+        dim_feedforward=128,
+        n_encoder_layers=2,
+        n_decoder_layers=1,
+        n_vae_encoder_layers=2,
+        latent_dim=16,
+        device="cpu",
+    )
+    defaults.update(overrides)
+    return ACTConfig(**defaults)
+
+
 class FakeDinov2Config:
     hidden_size = HIDDEN_SIZE
     patch_size = PATCH_SIZE
@@ -151,6 +182,32 @@ def test_dinov2_config_valid():
     assert config.dinov2_model_name == "facebook/dinov2-small"
 
 
+def test_vjepa2_config_valid():
+    config = _make_vjepa2_config()
+    assert config.vision_backbone == "vjepa2"
+    assert config.vjepa2_model_name == "vjepa2_1_vit_base_384"
+
+
+def test_vjepa2_config_requires_repo():
+    with pytest.raises(ValueError, match="vjepa2_repo_or_dir"):
+        _make_vjepa2_config(vjepa2_repo_or_dir="")
+
+
+def test_vjepa2_config_requires_model_name():
+    with pytest.raises(ValueError, match="vjepa2_model_name"):
+        _make_vjepa2_config(vjepa2_model_name="")
+
+
+def test_vjepa2_config_requires_positive_input_frames():
+    with pytest.raises(ValueError, match="vjepa2_input_frames"):
+        _make_vjepa2_config(vjepa2_input_frames=0)
+
+
+def test_vjepa2_config_requires_positive_spatial_pool():
+    with pytest.raises(ValueError, match="vjepa2_spatial_pool_size"):
+        _make_vjepa2_config(vjepa2_spatial_pool_size=0)
+
+
 # ── Dinov2BackboneWrapper ────────────────────────────────────────────
 
 
@@ -185,7 +242,7 @@ def test_dinov2_wrapper_auto_resizes(fake_dinov2):
 def test_act_dinov2_instantiation(fake_dinov2):
     config = _make_dinov2_config()
     model = ACT(config)
-    assert isinstance(model.backbone, Dinov2BackboneWrapper)
+    assert isinstance(model.backbone.backbone, Dinov2BackboneWrapper)
 
 
 def test_act_dinov2_forward(fake_dinov2):

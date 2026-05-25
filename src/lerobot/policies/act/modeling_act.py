@@ -44,6 +44,7 @@ from lerobot.utils.vit_backbones import (  # noqa: F401 — re-exported for back
     Dinov2BackboneWrapper,
     MoCoV3BackboneWrapper,
     SiglipBackboneWrapper,
+    VJepa2BackboneWrapper,
     VoltronBackboneWrapper,
     build_vit_backbone,
 )

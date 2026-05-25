@@ -142,6 +142,27 @@ class ACTConfig(PreTrainedConfig):
     cpmae_embed_dim: int = 384
     cpmae_depth: int = 12
     cpmae_n_heads: int = 6
+    # V-JEPA 2 / 2.1 backbone (used when vision_backbone starts with "vjepa2").
+    vjepa2_repo_or_dir: str = "facebookresearch/vjepa2"
+    vjepa2_model_name: str = "vjepa2_1_vit_base_384"
+    # Optional local path or URL. If None, uses Meta's public fbaipublicfiles checkpoint URL.
+    vjepa2_checkpoint_url: str | None = None
+    vjepa2_input_frames: int = 1
+    vjepa2_spatial_pool_size: int | None = None
+    # SD3/SDXL/FLUX VAE backbone (used when vision_backbone starts with "sd3vae").
+    sd3vae_model_name: str = "stabilityai/stable-diffusion-3-medium-diffusers"
+    sd3vae_subfolder: str = "vae"
+    # Feature tensor to expose from the SD3 VAE encoder. "latent_mean" preserves
+    # the original behavior; values like "latent_moments", "mid_block", and
+    # "down_blocks.2" enable control-oriented feature probes.
+    sd3vae_feature_layer: str = "latent_mean"
+    # Trainable 1x1 projection dim for generation VAE latents (sd3vae/wanvae).
+    vae_latent_proj_dim: int | None = 256
+    vae_encode_batch_size: int = 64
+    # Spatial pooling for VAE latents. The SD3 VAE produces 28×28 spatial maps from
+    # 224px input; ACT flattens these to sequence tokens, causing O(n²) attention OOM.
+    # Set to 14 to match ViT-style token counts (14×14=196 tokens per camera).
+    vae_spatial_pool_size: int | None = 14
     # Per-backbone pretraining input normalization applied inside the model, AFTER any
     # dataset-statistic normalization. Use this to match the pixel statistics the backbone
     # was pretrained with (e.g. "imagenet" for ResNet/DINOv2/MoCov3/MVP/VC-1/Voltron,
@@ -192,7 +213,16 @@ class ACTConfig(PreTrainedConfig):
         super().__post_init__()
 
         """Input validation (not exhaustive)."""
-        supported_prefixes = ("resnet", "siglip", "dinov2", "mocov3", "voltron", "cpmae")
+        supported_prefixes = (
+            "resnet",
+            "siglip",
+            "dinov2",
+            "mocov3",
+            "voltron",
+            "cpmae",
+            "vjepa2",
+            "sd3vae",
+        )
         if not any(self.vision_backbone.startswith(p) for p in supported_prefixes):
             raise ValueError(
                 f"`vision_backbone` must start with one of {supported_prefixes}. Got {self.vision_backbone}."
@@ -230,6 +260,40 @@ class ACTConfig(PreTrainedConfig):
                 "`cpmae_checkpoint_path` must be set when using a CP-MAE vision backbone "
                 "(e.g. 'results/M3_cpmae/R200_cpmae/encoder_final.pt')."
             )
+        if self.vision_backbone.startswith("vjepa2") and not self.vjepa2_repo_or_dir:
+            raise ValueError("`vjepa2_repo_or_dir` must be set when using a V-JEPA2 vision backbone.")
+        if self.vision_backbone.startswith("vjepa2") and not self.vjepa2_model_name:
+            raise ValueError("`vjepa2_model_name` must be set when using a V-JEPA2 vision backbone.")
+        if self.vision_backbone.startswith("vjepa2") and self.vjepa2_input_frames < 1:
+            raise ValueError(f"`vjepa2_input_frames` must be >= 1. Got {self.vjepa2_input_frames}.")
+        if (
+            self.vision_backbone.startswith("vjepa2")
+            and self.vjepa2_spatial_pool_size is not None
+            and self.vjepa2_spatial_pool_size < 1
+        ):
+            raise ValueError(
+                f"`vjepa2_spatial_pool_size` must be >= 1 or None. Got {self.vjepa2_spatial_pool_size}."
+            )
+        if self.vision_backbone.startswith("sd3vae") and not self.sd3vae_model_name:
+            raise ValueError(
+                "`sd3vae_model_name` must be set when using an SD3 VAE vision backbone "
+                "(e.g. 'stabilityai/stable-diffusion-3-medium-diffusers')."
+            )
+        if self.vision_backbone.startswith("sd3vae") and not self.sd3vae_feature_layer:
+            raise ValueError("`sd3vae_feature_layer` must be non-empty when using an SD3 VAE backbone.")
+        if self.vision_backbone.startswith("sd3vae"):
+            if self.freeze_backbone:
+                _logger.warning(
+                    "SD3 VAE encoder is frozen internally. Setting freeze_backbone=True "
+                    "also freezes the trainable latent projection; consider freeze_backbone=False."
+                )
+            if self.backbone_input_norm != "identity":
+                _logger.warning(
+                    "SD3 VAE handles its own [0,1]->[-1,1] scaling; "
+                    "forcing backbone_input_norm from %r to 'identity'.",
+                    self.backbone_input_norm,
+                )
+                self.backbone_input_norm = "identity"
 
         # Validate the backbone input-normalization preset and auto-disable the pipeline
         # VISUAL normalization when a pretraining preset is selected, to avoid applying
